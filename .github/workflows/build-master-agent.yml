@@ -1,0 +1,33 @@
+name: Build master ironrdp-agent
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_BACKTRACE: short
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Windows x64 binary from master
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.94.1 --profile minimal
+          $env:RUSTFLAGS = '-C target-feature=+crt-static'
+          cargo +1.94.1 build --locked --release --package ironrdp-agent
+          Get-FileHash target/release/ironrdp-agent.exe -Algorithm SHA256 | Format-List
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironrdp-agent-master-windows-x64
+          path: target/release/ironrdp-agent.exe
