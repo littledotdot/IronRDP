@@ -594,8 +594,7 @@ impl Daemon {
     ///
     /// Panics if the daemon or session state mutex is poisoned.
     pub fn current_frame(&self) -> Option<Frame> {
-        self.current_frame_shared()
-            .map(|frame| frame.as_ref().clone())
+        self.current_frame_shared().map(|frame| frame.as_ref().clone())
     }
 
     fn current_frame_shared(&self) -> Option<Arc<Frame>> {
