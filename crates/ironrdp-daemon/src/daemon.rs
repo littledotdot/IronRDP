@@ -27,7 +27,7 @@ use ironrdp_propertyset::{PropertySet, Value};
 use ironrdp_rail::pdu::{ExecutePdu, RailPdu};
 use ironrdp_tls::CertificateValidation;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(windows)]
@@ -112,19 +112,55 @@ where
                 write_message(&mut stream, &Response::Ok(Payload::NowEvent(event))).await?;
             }
         }
+        DaemonResponse::FrameStream(response, mut frames) => {
+            write_message(&mut stream, &response).await?;
+
+            // A watch receiver naturally coalesces frames while the consumer is busy writing:
+            // the client always receives the latest retained framebuffer instead of building a queue.
+            let sequence = *frames.borrow_and_update();
+            if sequence != 0 {
+                write_frame(&mut stream, daemon, sequence).await?;
+            }
+
+            while frames.changed().await.is_ok() {
+                let sequence = *frames.borrow_and_update();
+                write_frame(&mut stream, daemon, sequence).await?;
+            }
+        }
     }
     Ok(())
+}
+
+async fn write_frame<S>(stream: &mut S, daemon: &Daemon, sequence: u64) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(frame) = daemon.current_frame() else {
+        return Ok(());
+    };
+    let bgr = encode_bgr(&frame.pixels);
+    write_message(
+        stream,
+        &Response::Ok(Payload::Frame {
+            sequence,
+            width: frame.width,
+            height: frame.height,
+            bgr,
+        }),
+    )
+    .await
 }
 
 enum DaemonResponse {
     Single(Response),
     Stream(Response, OperationAttachment),
+    FrameStream(Response, watch::Receiver<u64>),
 }
 
 impl DaemonResponse {
     fn response(&self) -> &Response {
         match self {
-            Self::Single(response) | Self::Stream(response, _) => response,
+            Self::Single(response) | Self::Stream(response, _) | Self::FrameStream(response, _) => response,
         }
     }
 }
@@ -271,6 +307,7 @@ struct Session {
     destination: String,
     rail_enabled: bool,
     live: Arc<Mutex<Live>>,
+    frame_rx: watch::Receiver<u64>,
     rail_notify: Arc<tokio::sync::Notify>,
     now_endpoint: Arc<NowEndpoint>,
     operations: OperationManager,
@@ -576,6 +613,7 @@ impl Daemon {
                 DaemonResponse::Single(self.query_logs(substring.as_deref(), last))
             }
             Request::Screenshot => DaemonResponse::Single(self.screenshot()),
+            Request::FrameStream => self.frame_stream(),
             Request::ClipboardGet => DaemonResponse::Single(self.clipboard_get()),
             Request::ClipboardSet { text } => DaemonResponse::Single(self.clipboard_set(text)),
             Request::ClipboardGetImage => DaemonResponse::Single(self.clipboard_get_image()),
@@ -793,6 +831,7 @@ impl Daemon {
         )));
 
         let rail_notify = Arc::new(tokio::sync::Notify::new());
+        let (frame_tx, frame_rx) = watch::channel(0u64);
         let live = Arc::new(Mutex::new(Live {
             properties: live_seed,
             state: ConnState::Connecting,
@@ -834,6 +873,7 @@ impl Daemon {
             output_rx,
             Arc::clone(&live),
             self.notification.clone(),
+            frame_tx,
             Arc::clone(&rail_notify),
             Arc::clone(&self.next_rail_generation),
         ));
@@ -846,6 +886,7 @@ impl Daemon {
             destination,
             rail_enabled,
             live,
+            frame_rx,
             rail_notify,
             operations: OperationManager::new(Arc::clone(&now_endpoint)),
             now_endpoint,
@@ -1074,15 +1115,32 @@ impl Daemon {
         Response::Ok(Payload::RailLaunch(launch))
     }
 
-    fn screenshot(&self) -> Response {
+    fn frame_stream(&self) -> DaemonResponse {
         let guard = self.state.lock().expect("daemon state poisoned");
         let Some(session) = guard.as_ref() else {
-            return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no active session");
+            return DaemonResponse::Single(Response::typed_error(
+                crate::ipc::AgentErrorCategory::Unavailable,
+                "no active session",
+            ));
         };
-        let live = session.live.lock().expect("session live state poisoned");
-        let Some(frame) = live.frame.as_ref() else {
-            return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no frame available yet");
+        DaemonResponse::FrameStream(Response::ok(), session.frame_rx.clone())
+    }
+
+    fn screenshot(&self) -> Response {
+        let frame = {
+            let guard = self.state.lock().expect("daemon state poisoned");
+            let Some(session) = guard.as_ref() else {
+                return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no active session");
+            };
+            let live = session.live.lock().expect("session live state poisoned");
+            let Some(frame) = live.frame.clone() else {
+                return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no frame available yet");
+            };
+            frame
         };
+
+        // PNG compression is intentionally outside the live-state lock so incoming RDP frames are
+        // never blocked by a compatibility screenshot request.
         match encode_png(frame.width, frame.height, &frame.pixels) {
             Ok(png) => {
                 debug!(
@@ -1522,12 +1580,14 @@ async fn consume_output(
     mut output_rx: OutputEventReceiver,
     live: Arc<Mutex<Live>>,
     notification: Option<mpsc::Sender<()>>,
+    frame_tx: watch::Sender<u64>,
     rail_notify: Arc<tokio::sync::Notify>,
     next_rail_generation: Arc<AtomicU64>,
 ) {
     while let Some(event) = output_rx.recv().await {
         let mut guard = live.lock().expect("session live state poisoned");
         let previous = guard.state;
+        let mut frame_changed = false;
         let rail_changed = match event {
             RdpOutputEvent::Connected => {
                 guard.state = ConnState::Connected;
@@ -1647,6 +1707,7 @@ async fn consume_output(
                     height,
                     pixels: buffer,
                 });
+                frame_changed = true;
                 guard.state = ConnState::Connected;
                 guard.error = None;
                 if previous != ConnState::Connected {
@@ -1682,6 +1743,10 @@ async fn consume_output(
             _ => false,
         };
         drop(guard);
+        if frame_changed {
+            let next = (*frame_tx.borrow()).wrapping_add(1);
+            frame_tx.send_replace(next);
+        }
         if rail_changed {
             rail_notify.notify_waiters();
         }
@@ -1710,6 +1775,16 @@ fn notify(notification: &Option<mpsc::Sender<()>>) {
     if let Some(notification) = notification {
         let _ = notification.try_send(());
     }
+}
+
+/// Converts retained 0x00RRGGBB pixels to tightly packed BGR24 for local frame streaming.
+fn encode_bgr(pixels: &[u32]) -> Vec<u8> {
+    let mut bgr = Vec::with_capacity(pixels.len() * 3);
+    for pixel in pixels {
+        let [b, g, r, _] = pixel.to_le_bytes();
+        bgr.extend_from_slice(&[b, g, r]);
+    }
+    bgr
 }
 
 /// Encodes a retained framebuffer to PNG bytes.
