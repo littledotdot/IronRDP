@@ -300,7 +300,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod deterministic_tests {
     use super::*;
