@@ -3036,7 +3036,10 @@ mod tests {
     fn frame_stream_request_and_payload_round_trip() {
         let request = Request::FrameStream;
         let encoded = encode_vec(&request).expect("encode frame stream request");
-        assert_eq!(decode::<Request>(&encoded).expect("decode frame stream request"), request);
+        assert_eq!(
+            decode::<Request>(&encoded).expect("decode frame stream request"),
+            request
+        );
 
         let response = Response::Ok(Payload::Frame {
             sequence: 7,
@@ -3045,7 +3048,10 @@ mod tests {
             bgr: vec![1, 2, 3, 4, 5, 6],
         });
         let encoded = encode_vec(&response).expect("encode frame response");
-        assert_eq!(decode::<Response>(&encoded).expect("decode frame response"), response);
+        assert_eq!(
+            decode::<Response>(&encoded).expect("decode frame response"),
+            response
+        );
     }
 
     #[test]
