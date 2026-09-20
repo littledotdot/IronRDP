@@ -1963,7 +1963,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ironrdp_cfg::{GatewayUsageMethod, PropertySetExt as _};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     use ironrdp_client::output_channel::output_channel;
     use ironrdp_client::rdp::{RdpInputEvent, RdpInputSender};
@@ -1974,7 +1974,7 @@ mod tests {
     use super::{
         ConnState, Daemon, DaemonOptions, Live, MAX_PENDING_RAIL_LAUNCHES, MAX_RAIL_RETAINED_EVENTS,
         MAX_UNICODE_TEXT_CHARS, NowEndpoint, OperationManager, RailLedger, RdpdrDriveConfig, ResizeError, Session,
-        consume_output, enqueue_unicode_text, notify,
+        consume_output, encode_bgr, enqueue_unicode_text, notify,
     };
     use crate::ipc::{Payload, Response};
     use ironrdp_rpc::ipc::{RailEventKind, RailExecuteRequest, RailLaunchInfo};
@@ -1990,6 +1990,12 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn framebuffer_bgr_conversion_matches_retained_pixel_layout() {
+        let bgr = encode_bgr(&[0x0011_2233, 0x00AA_BBCC]);
+        assert_eq!(bgr, vec![0x33, 0x22, 0x11, 0xCC, 0xBB, 0xAA]);
     }
 
     #[test]
@@ -2109,6 +2115,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             Arc::clone(&rail_notify),
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2150,12 +2157,14 @@ mod tests {
             rail: RailLedger::new(1, 1, None),
         }));
         let rail_notify = Arc::new(tokio::sync::Notify::new());
+        let (_frame_tx, frame_rx) = watch::channel(0u64);
         *daemon.state.lock().expect("daemon state poisoned") = Some(Session {
             input_tx,
             input_db: Database::new(),
             destination: "server.example".to_owned(),
             rail_enabled,
             live: Arc::clone(&live),
+            frame_rx,
             rail_notify: Arc::clone(&rail_notify),
             operations: OperationManager::new(Arc::clone(&now_endpoint)),
             now_endpoint,
@@ -2172,6 +2181,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2291,6 +2301,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2360,6 +2371,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2421,6 +2433,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2458,6 +2471,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
