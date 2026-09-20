@@ -361,7 +361,7 @@ mod deterministic_tests {
             channel_id: CHANNEL_ID,
         };
 
-        let result = process_client::<TestPipe>(&mut ctx)
+        let result = Box::pin(process_client::<TestPipe>(&mut ctx))
             .await
             .expect("test pipe processing");
         assert!(matches!(result, NextWorkerState::Reconnect));
