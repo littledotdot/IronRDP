@@ -467,6 +467,10 @@ async fn handle_request(shared: &Arc<Shared>, dispatcher: isize, request: Reques
         Request::QueryProps { filter } => query_props(shared, filter.as_ref()),
         Request::QueryLogs { substring, last } => query_logs(shared, substring.as_deref(), last),
         Request::Screenshot => screenshot(shared),
+        Request::FrameStream => Response::typed_error(
+            AgentErrorCategory::Unavailable,
+            "frame streaming is unavailable through ActiveX",
+        ),
         Request::MouseMove { x, y } => {
             queue_command(shared, dispatcher, |response| Command::Input {
                 operation: Operation::MouseMove(ironrdp_input::MousePosition { x, y }),
