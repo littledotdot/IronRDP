@@ -135,7 +135,7 @@ async fn write_frame<S>(stream: &mut S, daemon: &Daemon, sequence: u64) -> anyho
 where
     S: AsyncWrite + Unpin,
 {
-    let Some(frame) = daemon.current_frame() else {
+    let Some(frame) = daemon.current_frame_shared() else {
         return Ok(());
     };
     let bgr = encode_bgr(&frame.pixels);
@@ -348,7 +348,7 @@ struct Live {
     error: Option<String>,
     /// Most recent frame (with the cursor already composited in by the session). Replaced on every
     /// graphics update; `None` until the first frame arrives.
-    frame: Option<Frame>,
+    frame: Option<Arc<Frame>>,
     rail_initial_execute: Option<(u16, String)>,
     rail: RailLedger,
 }
@@ -594,6 +594,11 @@ impl Daemon {
     ///
     /// Panics if the daemon or session state mutex is poisoned.
     pub fn current_frame(&self) -> Option<Frame> {
+        self.current_frame_shared()
+            .map(|frame| frame.as_ref().clone())
+    }
+
+    fn current_frame_shared(&self) -> Option<Arc<Frame>> {
         let guard = self.state.lock().expect("daemon state poisoned");
         guard
             .as_ref()
@@ -1127,16 +1132,8 @@ impl Daemon {
     }
 
     fn screenshot(&self) -> Response {
-        let frame = {
-            let guard = self.state.lock().expect("daemon state poisoned");
-            let Some(session) = guard.as_ref() else {
-                return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no active session");
-            };
-            let live = session.live.lock().expect("session live state poisoned");
-            let Some(frame) = live.frame.clone() else {
-                return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no frame available yet");
-            };
-            frame
+        let Some(frame) = self.current_frame_shared() else {
+            return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no frame available yet");
         };
 
         // PNG compression is intentionally outside the live-state lock so incoming RDP frames are
@@ -1702,11 +1699,11 @@ async fn consume_output(
                 let height = height.get();
                 guard.properties.insert("desktopwidth", width);
                 guard.properties.insert("desktopheight", height);
-                guard.frame = Some(Frame {
+                guard.frame = Some(Arc::new(Frame {
                     width,
                     height,
                     pixels: buffer,
-                });
+                }));
                 frame_changed = true;
                 guard.state = ConnState::Connected;
                 guard.error = None;
