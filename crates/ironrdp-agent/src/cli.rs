@@ -2126,6 +2126,13 @@ fn print_payload(payload: Payload) {
         }
         // Screenshots are handled out-of-band by `write_screenshot`, never printed.
         Payload::Screenshot { width, height, .. } => println!("frame {width}x{height}"),
+        // FrameStream is consumed programmatically over IPC; the CLI has no streaming command.
+        Payload::Frame {
+            sequence,
+            width,
+            height,
+            ..
+        } => println!("frame #{sequence} {width}x{height}"),
         Payload::NowCapabilities(capabilities) => {
             println!("NOW {}.{}", capabilities.version_major, capabilities.version_minor);
         }
