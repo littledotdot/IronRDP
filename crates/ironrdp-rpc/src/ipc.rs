@@ -3048,10 +3048,7 @@ mod tests {
             bgr: vec![1, 2, 3, 4, 5, 6],
         });
         let encoded = encode_vec(&response).expect("encode frame response");
-        assert_eq!(
-            decode::<Response>(&encoded).expect("decode frame response"),
-            response
-        );
+        assert_eq!(decode::<Response>(&encoded).expect("decode frame response"), response);
     }
 
     #[test]
