@@ -230,7 +230,6 @@ async fn worker<P: OsPipe>(mut bridged_ctx: BridgedWorkerCtx) -> Result<(), DvcP
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
