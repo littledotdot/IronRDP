@@ -166,7 +166,7 @@ async fn process_client<P: OsPipe>(ctx: &mut BridgedWorkerCtx) -> Result<NextWor
                 )
                 .map_err(DvcPipeProxyError::EncodeDvcMessage)?;
 
-                if let Err(error) = (ctx.on_write_dvc)(0, messages) {
+                if let Err(error) = (ctx.on_write_dvc)(ctx.channel_id, messages) {
                     error!(%channel_name, %pipe_name, ?error, "DVC pipe proxy write callback failed");
                 }
             }
@@ -228,4 +228,74 @@ async fn worker<P: OsPipe>(mut bridged_ctx: BridgedWorkerCtx) -> Result<(), DvcP
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    use ironrdp_dvc::DvcMessageBatch;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::UnixStream;
+
+    use super::{BridgedWorkerCtx, NextWorkerState, process_client};
+    use crate::platform::unix::UnixPipe;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn pipe_messages_are_routed_with_their_dvc_channel_id() {
+        let channel_id = 10;
+        let pipe_name = PathBuf::from(format!(
+            "/tmp/ironrdp-dvc-proxy-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before Unix epoch")
+                .as_nanos()
+        ));
+        let observed_channel_id = Arc::new(Mutex::new(None));
+        let observed_channel_id_clone = Arc::clone(&observed_channel_id);
+        let (_to_pipe_tx, to_pipe_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut context = BridgedWorkerCtx {
+            on_write_dvc: Box::new(move |callback_channel_id, messages| {
+                *observed_channel_id_clone.lock().expect("channel id mutex poisoned") = Some(callback_channel_id);
+                DvcMessageBatch::try_new(callback_channel_id, messages).map(|_| ())
+            }),
+            to_pipe_rx,
+            abort_event: Arc::new(Notify::new()),
+            pipe_name: pipe_name.to_string_lossy().into_owned(),
+            channel_name: "test".to_owned(),
+            channel_id,
+        };
+
+        let worker = tokio::spawn(async move { process_client::<UnixPipe>(&mut context).await });
+        let mut pipe = loop {
+            match UnixStream::connect(&pipe_name).await {
+                Ok(pipe) => break pipe,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    tokio::task::yield_now().await;
+                }
+                Err(error) => panic!("connect test DVC pipe: {error}"),
+            }
+        };
+        pipe.write_all(b"now").await.expect("write test DVC data");
+        drop(pipe);
+
+        assert!(matches!(
+            worker.await.expect("worker task panicked"),
+            Ok(NextWorkerState::Reconnect)
+        ));
+        assert_eq!(
+            *observed_channel_id.lock().expect("channel id mutex poisoned"),
+            Some(channel_id)
+        );
+        let _ = std::fs::remove_file(pipe_name);
+    }
 }

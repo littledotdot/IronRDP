@@ -1727,6 +1727,9 @@ fn encode_png(width: u16, height: u16, pixels: &[u32]) -> anyhow::Result<Vec<u8>
     let mut encoder = png::Encoder::new(&mut png, u32::from(width), u32::from(height));
     encoder.set_color(png::ColorType::Rgb);
     encoder.set_depth(png::BitDepth::Eight);
+    // Screenshots stay in-memory and cross a local Unix socket; prioritize
+    // frame latency over PNG size for the live preview path.
+    encoder.set_compression(png::Compression::Fast);
     let mut writer = encoder.write_header().context("write PNG header")?;
     writer.write_image_data(&rgb).context("write PNG image data")?;
     writer.finish().context("finish PNG stream")?;
