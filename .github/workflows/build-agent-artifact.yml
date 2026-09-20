@@ -1,0 +1,44 @@
+name: Build ironrdp-agent artifact
+
+on:
+  pull_request:
+    paths:
+      - "crates/ironrdp-agent/**"
+      - "crates/ironrdp-daemon/**"
+      - "crates/ironrdp-rpc/**"
+      - "crates/ironrdp-dvc-pipe-proxy/**"
+      - ".github/workflows/build-agent-artifact.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  RUST_BACKTRACE: short
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Add macOS arm64 target
+        run: rustup target add aarch64-apple-darwin
+
+      - name: Build macOS arm64 ironrdp-agent
+        run: cargo build --locked --release --package ironrdp-agent --target aarch64-apple-darwin
+
+      - name: Verify binary
+        run: |
+          file target/aarch64-apple-darwin/release/ironrdp-agent
+          shasum -a 256 target/aarch64-apple-darwin/release/ironrdp-agent
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironrdp-agent-macos-arm64
+          path: target/aarch64-apple-darwin/release/ironrdp-agent
+          if-no-files-found: error
