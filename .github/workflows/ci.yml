@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - codex/build-master-agent
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
