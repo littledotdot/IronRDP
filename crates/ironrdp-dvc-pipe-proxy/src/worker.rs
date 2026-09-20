@@ -299,3 +299,77 @@ mod tests {
         let _ = std::fs::remove_file(pipe_name);
     }
 }
+
+
+#[cfg(test)]
+mod deterministic_tests {
+    use super::*;
+
+    use async_trait::async_trait;
+    use ironrdp_dvc::DvcMessageBatch;
+    use std::sync::Mutex;
+
+    struct TestPipe {
+        sent_payload: bool,
+    }
+
+    #[async_trait]
+    impl OsPipe for TestPipe {
+        async fn connect(_pipe_name: &str) -> Result<Self, DvcPipeProxyError> {
+            Ok(Self { sent_payload: false })
+        }
+
+        async fn read(&mut self, buffer: &mut [u8]) -> Result<usize, DvcPipeProxyError> {
+            if self.sent_payload {
+                return Ok(0);
+            }
+
+            self.sent_payload = true;
+            let payload = b"now";
+            buffer[..payload.len()].copy_from_slice(payload);
+            Ok(payload.len())
+        }
+
+        async fn write_all(&mut self, _buffer: &[u8]) -> Result<(), DvcPipeProxyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_write_preserves_dynamic_channel_id() {
+        const CHANNEL_ID: u32 = 7;
+
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let observed_callback = Arc::clone(&observed);
+        let (to_pipe_tx, to_pipe_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut ctx = BridgedWorkerCtx {
+            on_write_dvc: Box::new(move |channel_id, messages| {
+                assert!(
+                    DvcMessageBatch::try_new(channel_id, messages).is_ok(),
+                    "callback channel ID must match encoded DVC messages"
+                );
+                observed_callback
+                    .lock()
+                    .expect("observed channel IDs poisoned")
+                    .push(channel_id);
+                Ok(())
+            }),
+            to_pipe_rx,
+            abort_event: Arc::new(Notify::new()),
+            pipe_name: "test".to_owned(),
+            channel_name: "Devolutions::Now::Agent".to_owned(),
+            channel_id: CHANNEL_ID,
+        };
+
+        let result = process_client::<TestPipe>(&mut ctx)
+            .await
+            .expect("test pipe processing");
+        assert!(matches!(result, NextWorkerState::Reconnect));
+        assert_eq!(
+            observed.lock().expect("observed channel IDs poisoned").as_slice(),
+            &[CHANNEL_ID]
+        );
+
+        drop(to_pipe_tx);
+    }
+}
