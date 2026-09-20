@@ -26,7 +26,7 @@ use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_propertyset::{PropertySet, Value};
 use ironrdp_rail::pdu::{ExecutePdu, RailPdu};
 use ironrdp_tls::CertificateValidation;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, trace, warn};
 
@@ -115,14 +115,14 @@ where
         DaemonResponse::FrameStream(response, mut frames) => {
             write_message(&mut stream, &response).await?;
 
-            // A watch receiver naturally coalesces frames while the consumer is busy writing:
-            // the client always receives the latest retained framebuffer instead of building a queue.
-            let sequence = *frames.borrow_and_update();
-            if sequence != 0 {
-                write_frame(&mut stream, daemon, sequence).await?;
-            }
-
-            while frames.changed().await.is_ok() {
+            // One credit requests one latest frame. Idle consumers cause no conversion
+            // or queued frames; their existing pacing controls the producer as well.
+            loop {
+                let credit = stream.read_u8().await?;
+                anyhow::ensure!(credit == 1, "invalid frame credit");
+                if *frames.borrow() == 0 && frames.changed().await.is_err() {
+                    break;
+                }
                 let sequence = *frames.borrow_and_update();
                 write_frame(&mut stream, daemon, sequence).await?;
             }
