@@ -26,8 +26,8 @@ use ironrdp_pdu::rdp::capability_sets::MajorPlatformType;
 use ironrdp_propertyset::{PropertySet, Value};
 use ironrdp_rail::pdu::{ExecutePdu, RailPdu};
 use ironrdp_tls::CertificateValidation;
-use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite};
+use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, trace, warn};
 
 #[cfg(windows)]
@@ -112,19 +112,55 @@ where
                 write_message(&mut stream, &Response::Ok(Payload::NowEvent(event))).await?;
             }
         }
+        DaemonResponse::FrameStream(response, mut frames) => {
+            write_message(&mut stream, &response).await?;
+
+            // One credit requests one latest frame. Idle consumers cause no conversion
+            // or queued frames; their existing pacing controls the producer as well.
+            loop {
+                let credit = stream.read_u8().await?;
+                anyhow::ensure!(credit == 1, "invalid frame credit");
+                if *frames.borrow() == 0 && frames.changed().await.is_err() {
+                    break;
+                }
+                let sequence = *frames.borrow_and_update();
+                write_frame(&mut stream, daemon, sequence).await?;
+            }
+        }
     }
     Ok(())
+}
+
+async fn write_frame<S>(stream: &mut S, daemon: &Daemon, sequence: u64) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
+    let Some(frame) = daemon.current_frame_shared() else {
+        return Ok(());
+    };
+    let bgr = encode_bgr(&frame.pixels);
+    write_message(
+        stream,
+        &Response::Ok(Payload::Frame {
+            sequence,
+            width: frame.width,
+            height: frame.height,
+            bgr,
+        }),
+    )
+    .await
 }
 
 enum DaemonResponse {
     Single(Response),
     Stream(Response, OperationAttachment),
+    FrameStream(Response, watch::Receiver<u64>),
 }
 
 impl DaemonResponse {
     fn response(&self) -> &Response {
         match self {
-            Self::Single(response) | Self::Stream(response, _) => response,
+            Self::Single(response) | Self::Stream(response, _) | Self::FrameStream(response, _) => response,
         }
     }
 }
@@ -261,7 +297,7 @@ pub struct Daemon {
     clipboard: Arc<Mutex<crate::clipboard::ClipboardState>>,
     /// Notifies an optional GUI frontend whenever retained live state changes.
     notification: Option<mpsc::Sender<()>>,
-    shutdown: tokio::sync::watch::Sender<()>,
+    shutdown: watch::Sender<()>,
 }
 
 /// Per-session state owned by the request handler.
@@ -271,6 +307,7 @@ struct Session {
     destination: String,
     rail_enabled: bool,
     live: Arc<Mutex<Live>>,
+    frame_rx: watch::Receiver<u64>,
     rail_notify: Arc<tokio::sync::Notify>,
     now_endpoint: Arc<NowEndpoint>,
     operations: OperationManager,
@@ -311,7 +348,7 @@ struct Live {
     error: Option<String>,
     /// Most recent frame (with the cursor already composited in by the session). Replaced on every
     /// graphics update; `None` until the first frame arrives.
-    frame: Option<Frame>,
+    frame: Option<Arc<Frame>>,
     rail_initial_execute: Option<(u16, String)>,
     rail: RailLedger,
 }
@@ -476,7 +513,7 @@ impl Daemon {
         // Credentials are considered "loaded" when the overlay provides at least one secret value,
         // which is what frees the caller from supplying a password.
         let credentials_loaded = overlay.iter().any(|(key, _)| ironrdp_cfg::is_secret_key(key));
-        let (shutdown, _) = tokio::sync::watch::channel(());
+        let (shutdown, _) = watch::channel(());
         let certificate_validation = options.certificate_validation();
         if certificate_validation == CertificateValidation::DangerouslyAcceptInvalidCertificate {
             warn!("TLS certificate and hostname validation are disabled by explicit daemon configuration");
@@ -547,7 +584,7 @@ impl Daemon {
     }
 
     /// Returns a receiver that is notified when the server should stop.
-    pub fn shutdown_receiver(&self) -> tokio::sync::watch::Receiver<()> {
+    pub fn shutdown_receiver(&self) -> watch::Receiver<()> {
         self.shutdown.subscribe()
     }
 
@@ -557,6 +594,10 @@ impl Daemon {
     ///
     /// Panics if the daemon or session state mutex is poisoned.
     pub fn current_frame(&self) -> Option<Frame> {
+        self.current_frame_shared().map(|frame| frame.as_ref().clone())
+    }
+
+    fn current_frame_shared(&self) -> Option<Arc<Frame>> {
         let guard = self.state.lock().expect("daemon state poisoned");
         guard
             .as_ref()
@@ -576,6 +617,7 @@ impl Daemon {
                 DaemonResponse::Single(self.query_logs(substring.as_deref(), last))
             }
             Request::Screenshot => DaemonResponse::Single(self.screenshot()),
+            Request::FrameStream => self.frame_stream(),
             Request::ClipboardGet => DaemonResponse::Single(self.clipboard_get()),
             Request::ClipboardSet { text } => DaemonResponse::Single(self.clipboard_set(text)),
             Request::ClipboardGetImage => DaemonResponse::Single(self.clipboard_get_image()),
@@ -793,6 +835,7 @@ impl Daemon {
         )));
 
         let rail_notify = Arc::new(tokio::sync::Notify::new());
+        let (frame_tx, frame_rx) = watch::channel(0u64);
         let live = Arc::new(Mutex::new(Live {
             properties: live_seed,
             state: ConnState::Connecting,
@@ -834,6 +877,7 @@ impl Daemon {
             output_rx,
             Arc::clone(&live),
             self.notification.clone(),
+            frame_tx,
             Arc::clone(&rail_notify),
             Arc::clone(&self.next_rail_generation),
         ));
@@ -846,6 +890,7 @@ impl Daemon {
             destination,
             rail_enabled,
             live,
+            frame_rx,
             rail_notify,
             operations: OperationManager::new(Arc::clone(&now_endpoint)),
             now_endpoint,
@@ -1074,15 +1119,24 @@ impl Daemon {
         Response::Ok(Payload::RailLaunch(launch))
     }
 
-    fn screenshot(&self) -> Response {
+    fn frame_stream(&self) -> DaemonResponse {
         let guard = self.state.lock().expect("daemon state poisoned");
         let Some(session) = guard.as_ref() else {
-            return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no active session");
+            return DaemonResponse::Single(Response::typed_error(
+                crate::ipc::AgentErrorCategory::Unavailable,
+                "no active session",
+            ));
         };
-        let live = session.live.lock().expect("session live state poisoned");
-        let Some(frame) = live.frame.as_ref() else {
+        DaemonResponse::FrameStream(Response::ok(), session.frame_rx.clone())
+    }
+
+    fn screenshot(&self) -> Response {
+        let Some(frame) = self.current_frame_shared() else {
             return Response::typed_error(crate::ipc::AgentErrorCategory::Unavailable, "no frame available yet");
         };
+
+        // PNG compression is intentionally outside the live-state lock so incoming RDP frames are
+        // never blocked by a compatibility screenshot request.
         match encode_png(frame.width, frame.height, &frame.pixels) {
             Ok(png) => {
                 debug!(
@@ -1522,12 +1576,14 @@ async fn consume_output(
     mut output_rx: OutputEventReceiver,
     live: Arc<Mutex<Live>>,
     notification: Option<mpsc::Sender<()>>,
+    frame_tx: watch::Sender<u64>,
     rail_notify: Arc<tokio::sync::Notify>,
     next_rail_generation: Arc<AtomicU64>,
 ) {
     while let Some(event) = output_rx.recv().await {
         let mut guard = live.lock().expect("session live state poisoned");
         let previous = guard.state;
+        let mut frame_changed = false;
         let rail_changed = match event {
             RdpOutputEvent::Connected => {
                 guard.state = ConnState::Connected;
@@ -1642,11 +1698,12 @@ async fn consume_output(
                 let height = height.get();
                 guard.properties.insert("desktopwidth", width);
                 guard.properties.insert("desktopheight", height);
-                guard.frame = Some(Frame {
+                guard.frame = Some(Arc::new(Frame {
                     width,
                     height,
                     pixels: buffer,
-                });
+                }));
+                frame_changed = true;
                 guard.state = ConnState::Connected;
                 guard.error = None;
                 if previous != ConnState::Connected {
@@ -1682,6 +1739,10 @@ async fn consume_output(
             _ => false,
         };
         drop(guard);
+        if frame_changed {
+            let next = (*frame_tx.borrow()).wrapping_add(1);
+            frame_tx.send_replace(next);
+        }
         if rail_changed {
             rail_notify.notify_waiters();
         }
@@ -1710,6 +1771,16 @@ fn notify(notification: &Option<mpsc::Sender<()>>) {
     if let Some(notification) = notification {
         let _ = notification.try_send(());
     }
+}
+
+/// Converts retained 0x00RRGGBB pixels to tightly packed BGR24 for local frame streaming.
+fn encode_bgr(pixels: &[u32]) -> Vec<u8> {
+    let mut bgr = Vec::with_capacity(pixels.len() * 3);
+    for pixel in pixels {
+        let [b, g, r, _] = pixel.to_le_bytes();
+        bgr.extend_from_slice(&[b, g, r]);
+    }
+    bgr
 }
 
 /// Encodes a retained framebuffer to PNG bytes.
@@ -1891,7 +1962,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ironrdp_cfg::{GatewayUsageMethod, PropertySetExt as _};
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, watch};
 
     use ironrdp_client::output_channel::output_channel;
     use ironrdp_client::rdp::{RdpInputEvent, RdpInputSender};
@@ -1902,7 +1973,7 @@ mod tests {
     use super::{
         ConnState, Daemon, DaemonOptions, Live, MAX_PENDING_RAIL_LAUNCHES, MAX_RAIL_RETAINED_EVENTS,
         MAX_UNICODE_TEXT_CHARS, NowEndpoint, OperationManager, RailLedger, RdpdrDriveConfig, ResizeError, Session,
-        consume_output, enqueue_unicode_text, notify,
+        consume_output, encode_bgr, enqueue_unicode_text, notify,
     };
     use crate::ipc::{Payload, Response};
     use ironrdp_rpc::ipc::{RailEventKind, RailExecuteRequest, RailLaunchInfo};
@@ -1918,6 +1989,12 @@ mod tests {
 
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(matches!(receiver.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn framebuffer_bgr_conversion_matches_retained_pixel_layout() {
+        let bgr = encode_bgr(&[0x0011_2233, 0x00AA_BBCC]);
+        assert_eq!(bgr, vec![0x33, 0x22, 0x11, 0xCC, 0xBB, 0xAA]);
     }
 
     #[test]
@@ -2037,6 +2114,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             Arc::clone(&rail_notify),
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2078,12 +2156,14 @@ mod tests {
             rail: RailLedger::new(1, 1, None),
         }));
         let rail_notify = Arc::new(tokio::sync::Notify::new());
+        let (_frame_tx, frame_rx) = watch::channel(0u64);
         *daemon.state.lock().expect("daemon state poisoned") = Some(Session {
             input_tx,
             input_db: Database::new(),
             destination: "server.example".to_owned(),
             rail_enabled,
             live: Arc::clone(&live),
+            frame_rx,
             rail_notify: Arc::clone(&rail_notify),
             operations: OperationManager::new(Arc::clone(&now_endpoint)),
             now_endpoint,
@@ -2100,6 +2180,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2219,6 +2300,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2288,6 +2370,7 @@ mod tests {
             output_rx,
             Arc::clone(&live),
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2349,6 +2432,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
@@ -2386,6 +2470,7 @@ mod tests {
             output_rx,
             live,
             None,
+            watch::channel(0u64).0,
             rail_notify,
             Arc::new(AtomicU64::new(2)),
         ));
