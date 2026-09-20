@@ -1,6 +1,15 @@
 name: Build ironrdp-agent artifact
 
 on:
+  push:
+    branches:
+      - codex/build-master-agent
+    paths:
+      - "crates/ironrdp-agent/**"
+      - "crates/ironrdp-daemon/**"
+      - "crates/ironrdp-rpc/**"
+      - "crates/ironrdp-dvc-pipe-proxy/**"
+      - ".github/workflows/build-agent-artifact.yml"
   pull_request:
     paths:
       - "crates/ironrdp-agent/**"
