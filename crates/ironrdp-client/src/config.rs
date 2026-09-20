@@ -1947,6 +1947,9 @@ impl ConfigBuilder {
             request_data: None,
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
+            // The current Progressive/SRL decoder is not compatible with all
+            // Windows RDPGFX streams; keep the legacy path until that decoder
+            // is fixed and covered by a real Windows replay.
             support_dyn_vc_gfx_protocol: false,
             compression_type,
             performance_flags: self.performance_flags.unwrap_or_default(),
