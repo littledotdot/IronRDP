@@ -296,10 +296,7 @@ mod tests {
             .expect("test pipe processing");
         assert!(matches!(result, NextWorkerState::Reconnect));
         assert_eq!(
-            observed
-                .lock()
-                .expect("observed channel IDs poisoned")
-                .as_slice(),
+            observed.lock().expect("observed channel IDs poisoned").as_slice(),
             &[CHANNEL_ID]
         );
 
