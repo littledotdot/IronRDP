@@ -20,7 +20,9 @@ use crate::ipc::{Request, Response};
 ///
 /// `pub(crate)` so `ipc` can derive payload-specific limits (e.g. the clipboard image cap) from
 /// the actual transport ceiling instead of an unrelated number that happens to also be a size.
-pub(crate) const MAX_MESSAGE_LEN: usize = 16 * 1024 * 1024;
+// Raw framebuffer streaming intentionally shares the existing framing. 64 MiB
+// covers a tightly packed BGR24 6K frame while retaining a bounded local IPC message.
+pub(crate) const MAX_MESSAGE_LEN: usize = 64 * 1024 * 1024;
 
 /// Writes `message` to `stream`, length-delimited.
 pub async fn write_message<S, M>(stream: &mut S, message: &M) -> anyhow::Result<()>
