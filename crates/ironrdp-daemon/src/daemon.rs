@@ -297,7 +297,7 @@ pub struct Daemon {
     clipboard: Arc<Mutex<crate::clipboard::ClipboardState>>,
     /// Notifies an optional GUI frontend whenever retained live state changes.
     notification: Option<mpsc::Sender<()>>,
-    shutdown: tokio::sync::watch::Sender<()>,
+    shutdown: watch::Sender<()>,
 }
 
 /// Per-session state owned by the request handler.
@@ -513,7 +513,7 @@ impl Daemon {
         // Credentials are considered "loaded" when the overlay provides at least one secret value,
         // which is what frees the caller from supplying a password.
         let credentials_loaded = overlay.iter().any(|(key, _)| ironrdp_cfg::is_secret_key(key));
-        let (shutdown, _) = tokio::sync::watch::channel(());
+        let (shutdown, _) = watch::channel(());
         let certificate_validation = options.certificate_validation();
         if certificate_validation == CertificateValidation::DangerouslyAcceptInvalidCertificate {
             warn!("TLS certificate and hostname validation are disabled by explicit daemon configuration");
@@ -584,7 +584,7 @@ impl Daemon {
     }
 
     /// Returns a receiver that is notified when the server should stop.
-    pub fn shutdown_receiver(&self) -> tokio::sync::watch::Receiver<()> {
+    pub fn shutdown_receiver(&self) -> watch::Receiver<()> {
         self.shutdown.subscribe()
     }
 
