@@ -340,14 +340,21 @@ fn enqueue_unicode_text(input_tx: &RdpInputSender, input_db: &mut Database, text
     Response::ok()
 }
 
+fn pointer_software_rendering_enabled(properties: &PropertySet) -> bool {
+    properties
+        .get::<u32>("ironrdp_pointer_software_rendering")
+        .is_some_and(|value| value != 0)
+}
+
 /// Per-session state shared with the output-consumer task.
 struct Live {
     /// Live property bag, seeded from `Config::properties` and updated on (re)negotiation.
     properties: PropertySet,
     state: ConnState,
     error: Option<String>,
-    /// Most recent frame (with the cursor already composited in by the session). Replaced on every
-    /// graphics update; `None` until the first frame arrives.
+    /// Most recent decoded frame. The remote cursor is composited only when
+    /// `ironrdp_pointer_software_rendering` is explicitly enabled.
+    /// Replaced on every graphics update; `None` until the first frame arrives.
     frame: Option<Arc<Frame>>,
     rail_initial_execute: Option<(u16, String)>,
     rail: RailLedger,
@@ -500,7 +507,8 @@ impl RailLedger {
 }
 
 /// A decoded frame retained for screenshots. `pixels` are `0x00RRGGBB` (`to_be_bytes()` yields
-/// `[0, R, G, B]`), row-major, `width * height` entries, with the remote cursor blended in.
+/// `[0, R, G, B]`), row-major, `width * height` entries. The remote cursor is present only when
+/// software pointer rendering is explicitly enabled for the session.
 #[derive(Clone)]
 pub struct Frame {
     pub width: u16,
@@ -588,7 +596,7 @@ impl Daemon {
         self.shutdown.subscribe()
     }
 
-    /// Returns the latest cursor-composited framebuffer, if one is available.
+    /// Returns the latest decoded framebuffer, if one is available.
     ///
     /// # Panics
     ///
@@ -741,6 +749,10 @@ impl Daemon {
 
         // Derive the headless client identity. These fields are never representable as `.rdp`
         // properties and are never prompted; the daemon supplies them itself.
+        // Automation keeps the decoded framebuffer cursor-free by default. Callers that
+        // explicitly need a composited remote pointer can opt in per connection.
+        let pointer_software_rendering = pointer_software_rendering_enabled(&properties);
+
         let builder = builder
             .with_client_build(client_build())
             .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
@@ -751,9 +763,7 @@ impl Daemon {
             // The headless agent observes validated RAIL state but does not implement local
             // move/size, taskbar, cloak, z-order, or display-power behavior.
             .with_rail_client_status_flags(0)
-            // Headless: composite the remote cursor into the framebuffer so it appears in
-            // screenshots (there is no separate overlay to draw it).
-            .with_pointer_software_rendering(true);
+            .with_pointer_software_rendering(pointer_software_rendering);
         // Prefer an explicit connect/overlay property; otherwise use the daemon startup default.
         // Always set smartcard explicitly so the client feature default (`true`) cannot announce a
         // smartcard device without a matching WinSCard backend.
@@ -1973,11 +1983,23 @@ mod tests {
     use super::{
         ConnState, Daemon, DaemonOptions, Live, MAX_PENDING_RAIL_LAUNCHES, MAX_RAIL_RETAINED_EVENTS,
         MAX_UNICODE_TEXT_CHARS, NowEndpoint, OperationManager, RailLedger, RdpdrDriveConfig, ResizeError, Session,
-        consume_output, encode_bgr, enqueue_unicode_text, notify,
+        consume_output, encode_bgr, enqueue_unicode_text, notify, pointer_software_rendering_enabled,
     };
     use crate::ipc::{Payload, Response};
     use ironrdp_rpc::ipc::{RailEventKind, RailExecuteRequest, RailLaunchInfo};
     use ironrdp_tls::CertificateValidation;
+
+    #[test]
+    fn software_cursor_rendering_is_opt_in() {
+        let mut properties = PropertySet::new();
+        assert!(!pointer_software_rendering_enabled(&properties));
+
+        properties.insert("ironrdp_pointer_software_rendering", 1u32);
+        assert!(pointer_software_rendering_enabled(&properties));
+
+        properties.insert("ironrdp_pointer_software_rendering", 0u32);
+        assert!(!pointer_software_rendering_enabled(&properties));
+    }
 
     #[test]
     fn framebuffer_notifications_are_coalesced() {
