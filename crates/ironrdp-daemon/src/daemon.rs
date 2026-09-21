@@ -303,14 +303,21 @@ fn enqueue_unicode_text(input_tx: &RdpInputSender, input_db: &mut Database, text
     Response::ok()
 }
 
+fn pointer_software_rendering_enabled(properties: &PropertySet) -> bool {
+    properties
+        .get::<u32>("ironrdp_pointer_software_rendering")
+        .is_some_and(|value| value != 0)
+}
+
 /// Per-session state shared with the output-consumer task.
 struct Live {
     /// Live property bag, seeded from `Config::properties` and updated on (re)negotiation.
     properties: PropertySet,
     state: ConnState,
     error: Option<String>,
-    /// Most recent frame (with the cursor already composited in by the session). Replaced on every
-    /// graphics update; `None` until the first frame arrives.
+    /// Most recent decoded frame. The remote cursor is composited only when
+    /// ironrdp_pointer_software_rendering is explicitly enabled.
+    /// Replaced on every graphics update; `None` until the first frame arrives.
     frame: Option<Frame>,
     rail_initial_execute: Option<(u16, String)>,
     rail: RailLedger,
@@ -699,6 +706,11 @@ impl Daemon {
 
         // Derive the headless client identity. These fields are never representable as `.rdp`
         // properties and are never prompted; the daemon supplies them itself.
+        // Headless automation should keep the decoded framebuffer free of the remote
+        // pointer by default. Consumers that need cursor-composited screenshots can opt in
+        // explicitly with ironrdp_pointer_software_rendering:i:1.
+        let pointer_software_rendering = pointer_software_rendering_enabled(&properties);
+
         let builder = builder
             .with_client_build(client_build())
             .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
@@ -709,9 +721,7 @@ impl Daemon {
             // The headless agent observes validated RAIL state but does not implement local
             // move/size, taskbar, cloak, z-order, or display-power behavior.
             .with_rail_client_status_flags(0)
-            // Headless: composite the remote cursor into the framebuffer so it appears in
-            // screenshots (there is no separate overlay to draw it).
-            .with_pointer_software_rendering(true);
+            .with_pointer_software_rendering(pointer_software_rendering);
         // Prefer an explicit connect/overlay property; otherwise use the daemon startup default.
         // Always set smartcard explicitly so the client feature default (`true`) cannot announce a
         // smartcard device without a matching WinSCard backend.
