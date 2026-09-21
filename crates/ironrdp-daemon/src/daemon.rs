@@ -1909,11 +1909,23 @@ mod tests {
     use super::{
         ConnState, Daemon, DaemonOptions, Live, MAX_PENDING_RAIL_LAUNCHES, MAX_RAIL_RETAINED_EVENTS,
         MAX_UNICODE_TEXT_CHARS, NowEndpoint, OperationManager, RailLedger, RdpdrDriveConfig, ResizeError, Session,
-        consume_output, enqueue_unicode_text, notify,
+        consume_output, enqueue_unicode_text, notify, pointer_software_rendering_enabled,
     };
     use crate::ipc::{Payload, Response};
     use ironrdp_rpc::ipc::{RailEventKind, RailExecuteRequest, RailLaunchInfo};
     use ironrdp_tls::CertificateValidation;
+
+    #[test]
+    fn software_cursor_rendering_is_opt_in() {
+        let mut properties = PropertySet::new();
+        assert!(!pointer_software_rendering_enabled(&properties));
+
+        properties.insert("ironrdp_pointer_software_rendering", 1u32);
+        assert!(pointer_software_rendering_enabled(&properties));
+
+        properties.insert("ironrdp_pointer_software_rendering", 0u32);
+        assert!(!pointer_software_rendering_enabled(&properties));
+    }
 
     #[test]
     fn framebuffer_notifications_are_coalesced() {
