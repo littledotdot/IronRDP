@@ -115,16 +115,25 @@ where
         DaemonResponse::FrameStream(response, mut frames) => {
             write_message(&mut stream, &response).await?;
 
-            // One credit requests one latest frame. Idle consumers cause no conversion
-            // or queued frames; their existing pacing controls the producer as well.
-            loop {
+            // One credit requests the next *new* framebuffer. If the consumer
+            // asks again before RDP produced another frame, wait on the watch
+            // channel instead of re-encoding and re-sending the same BGR24 frame.
+            let mut last_sent_sequence = 0u64;
+            'frame_stream: loop {
                 let credit = stream.read_u8().await?;
                 anyhow::ensure!(credit == 1, "invalid frame credit");
-                if *frames.borrow() == 0 && frames.changed().await.is_err() {
-                    break;
+
+                loop {
+                    let sequence = *frames.borrow_and_update();
+                    if sequence != 0 && sequence != last_sent_sequence {
+                        write_frame(&mut stream, daemon, sequence).await?;
+                        last_sent_sequence = sequence;
+                        break;
+                    }
+                    if frames.changed().await.is_err() {
+                        break 'frame_stream;
+                    }
                 }
-                let sequence = *frames.borrow_and_update();
-                write_frame(&mut stream, daemon, sequence).await?;
             }
         }
     }
