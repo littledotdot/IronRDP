@@ -926,7 +926,13 @@ where
 /// later. The sans-I/O crate takes the finished hash and stays free of any
 /// cryptographic dependency.
 fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
-    Sha256::digest(tunnel_config.security_cookie).into()
+    let mut hash: [u8; 32] = Sha256::digest(tunnel_config.security_cookie).into();
+    // MS-RDPEUDP 2.2.2.9 encodes eight 32-bit hash words in network order.
+    // Windows interprets the digest words as little-endian before that encoding.
+    for word in hash.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -934,6 +940,21 @@ mod tests {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    #[test]
+    fn cookie_hash_matches_windows_v3_wire_order() {
+        let config = TunnelConfig {
+            request_id: 1,
+            security_cookie: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        };
+        assert_eq!(
+            cookie_hash(&config),
+            [
+                0x26, 0xcb, 0x45, 0xbe, 0xbe, 0x36, 0xbf, 0x05, 0x84, 0x84, 0xe6, 0xbd, 0xfd, 0xf0, 0x28, 0x1a, 0x50,
+                0x98, 0xc6, 0x43, 0xfe, 0xe5, 0xdc, 0xa3, 0x28, 0x99, 0xa6, 0xdb, 0x91, 0x89, 0x3a, 0xee,
+            ]
+        );
+    }
 
     /// Dropping the guard stops the task rather than detaching it.
     ///
