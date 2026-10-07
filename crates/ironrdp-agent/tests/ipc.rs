@@ -318,3 +318,72 @@ fn session_list_and_disconnect_distinguish_session_from_daemon() {
         std::panic::resume_unwind(error);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn now_stream_replays_after_live_subscription_closes() {
+    use ironrdp_rpc::ipc::{
+        NowExecutionKind, OperationEvent, OperationEventKind, OperationInfo, OperationState, Payload, Request, Response,
+    };
+    use ironrdp_rpc::transport;
+
+    let endpoint = test_endpoint("now-replay");
+    let listener = std::os::unix::net::UnixListener::bind(&endpoint).expect("bind fake daemon");
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let info = OperationInfo {
+            id: 42,
+            kind: NowExecutionKind::PowerShell,
+            state: OperationState::Running,
+            detached: false,
+            exit_code: None,
+            error: None,
+            retained_output_bytes: 0,
+            next_sequence: 0,
+        };
+        for replay in [false, true] {
+            let (stream, _) = listener.accept().expect("accept IPC");
+            stream.set_nonblocking(true).expect("nonblocking");
+            runtime.block_on(async {
+                let mut stream = tokio::net::UnixStream::from_std(stream).expect("async stream");
+                let request: Request = transport::read_message(&mut stream).await.expect("request");
+                if replay {
+                    assert_eq!(
+                        request,
+                        Request::NowAttach {
+                            operation_id: 42,
+                            after_sequence: Some(0)
+                        }
+                    );
+                } else {
+                    assert!(matches!(request, Request::NowExecute(_)));
+                }
+                transport::write_message(&mut stream, &Response::Ok(Payload::NowOperation(info.clone())))
+                    .await
+                    .expect("header");
+                let event = OperationEvent {
+                    operation_id: 42,
+                    sequence: u64::from(replay),
+                    kind: if replay {
+                        OperationEventKind::Completed { exit_code: 0 }
+                    } else {
+                        OperationEventKind::Started
+                    },
+                };
+                transport::write_message(&mut stream, &Response::Ok(Payload::NowEvent(event)))
+                    .await
+                    .expect("event");
+            });
+        }
+    });
+    let output = agent(
+        &endpoint,
+        &["now", "--format", "ndjson", "powershell", "Write-Output replay-ok"],
+    );
+    server.join().expect("fake daemon");
+    let _ = std::fs::remove_file(&endpoint);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    assert_eq!(stdout.matches("\"type\":\"started\"").count(), 1);
+    assert_eq!(stdout.matches("\"type\":\"completed\"").count(), 1);
+}

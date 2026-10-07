@@ -2207,6 +2207,8 @@ async fn now_stream(
 
     let mut exit_code = payload_remote_exit(&first);
     let mut terminal_observed = payload_is_terminal_operation(&first);
+    let mut last_sequence = None;
+    let mut reattached_sequence = None;
     if let Some(path) = operation_id_file {
         let Payload::NowOperation(operation) = &first else {
             anyhow::bail!("unexpected response while writing operation ID");
@@ -2233,10 +2235,38 @@ async fn now_stream(
                     )
                 }) =>
             {
-                if !terminal_observed {
-                    anyhow::bail!("NOW operation stream closed before a terminal event");
+                if terminal_observed {
+                    break;
                 }
-                break;
+                let Payload::NowOperation(operation) = &first else {
+                    anyhow::bail!("NOW operation stream closed before a terminal event");
+                };
+                let Some(sequence) = last_sequence else {
+                    anyhow::bail!("NOW operation stream closed without an event");
+                };
+                if reattached_sequence == Some(sequence) {
+                    anyhow::bail!("NOW operation replay made no progress");
+                }
+                // The daemon drops slow live subscribers; recover retained events
+                // after the last printed sequence without executing the command again.
+                stream = transport::open_stream(
+                    endpoint,
+                    &Request::NowAttach {
+                        operation_id: operation.id,
+                        after_sequence: Some(sequence),
+                    },
+                )
+                .await?;
+                let header: Response = transport::read_message(&mut stream).await?;
+                match header {
+                    Response::Ok(payload) => {
+                        terminal_observed = payload_is_terminal_operation(&payload);
+                        exit_code = payload_remote_exit(&payload).or(exit_code);
+                    }
+                    Response::Err(error) => return Err(DaemonRequestError(error).into()),
+                }
+                reattached_sequence = Some(sequence);
+                continue;
             }
             Err(error) => return Err(error),
         };
@@ -2245,6 +2275,7 @@ async fn now_stream(
             Response::Err(error) => return Err(DaemonRequestError(error).into()),
         };
         if let Payload::NowEvent(event) = &payload {
+            last_sequence = Some(event.sequence);
             match &event.kind {
                 OperationEventKind::Completed { exit_code: code } => {
                     terminal_observed = true;

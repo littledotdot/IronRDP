@@ -325,7 +325,8 @@ PowerShell and pwsh use `-NoProfile` and `-NonInteractive` by default. `--profil
 `--interactive` are explicit opt-outs. The agent retains at most 8 MiB of output per operation, 32
 terminal records, and 32 MiB across retained records. `now attach --after-sequence N` replays
 bounded output then follows a running operation. Live attachments are bounded and disconnect when
-they cannot keep up; attach again with the last sequence number to resume from retained output. Use
+they cannot keep up; the CLI automatically reattaches after its last received sequence without
+executing the command again. Repeated closures without progress remain errors. Use
 `now --format human|json|ndjson` for raw human streaming, a JSON result, or JSON event lines; JSON
 represents output bytes as arrays and is bounded to 8,192 events and 2 MiB of output. Use NDJSON
 for unbounded streaming.
