@@ -17,3 +17,11 @@ Smartcard is also honored from connect/overlay property `ironrdp_smartcard`:
 - connect-time `ironrdp_smartcard:i:0` disables smartcard for that session
 
 Smartcard-only sessions use an empty drive list with device ID `0` reserved for the smartcard device.
+
+## Wendao transport and frame stream
+
+This integration build includes the client `udp` feature. Set connect/overlay property
+`ironrdp_udp_transport:i:1` to request reliable UDP multitransport, or `:0` for TCP.
+Unsupported transports and failed bootstrap keep TCP; migrated-channel loss reconnects.
+FrameStream uses request tag 41 and BGR24 payload tag 18, with one-byte credits.
+Update Wendao and the agent together, then restart the daemon.
