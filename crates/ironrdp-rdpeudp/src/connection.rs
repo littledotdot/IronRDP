@@ -148,7 +148,9 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             initial_sequence_number: 0,
-            log_window_size: 6,
+            // A 64-packet window fills during Windows GFX bursts and recovery.
+            // Use the bounded RDP-UDP2 maximum (MS-RDPEUDP2 3.1.1.1.3).
+            log_window_size: 15,
             upstream_mtu: 1232,
             downstream_mtu: 1232,
             idle_timeout: Duration::from_secs(65),
@@ -1487,17 +1489,27 @@ impl RdpeudpConnection {
             "Connection established"
         );
 
-        self.send_window = Some(SendWindow::new(
+        let mut send_window = SendWindow::new(
             local_initial_data_seq,
             local_initial_channel_seq,
             params.log_window_size,
-        ));
+        );
 
-        self.recv_window = Some(RecvWindow::new(
+        let mut recv_window = RecvWindow::new(
             remote_initial_data_seq,
             remote_initial_channel_seq,
             params.log_window_size,
-        ));
+        );
+
+        // [MS-RDPEUDP2] Appendix A, note 1: Windows always skips channel
+        // sequence zero. DataSeqNum still wraps through zero independently.
+        // https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpeudp2/add0cb95-3df2-45ce-8b6b-bb18b6f03fbe
+        if params.wire == WireFormat::V2 {
+            send_window.use_nonzero_channel_seq();
+            recv_window.use_nonzero_channel_seq();
+        }
+        self.send_window = Some(send_window);
+        self.recv_window = Some(recv_window);
 
         self.timers.set(Timer::Idle, now + self.config.idle_timeout);
         self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
@@ -2743,6 +2755,35 @@ impl core::fmt::Debug for RdpeudpConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Windows capture: normal ChannelSeqNum 65535 is followed by 1,
+    // while DataSeqNum continues normally. A dummy's channel zero is ignored.
+    #[test]
+    fn windows_v3_channel_wrap_does_not_wait_for_zero() {
+        let now = MonotonicInstant::from_millis(0);
+        let mut conn = RdpeudpConnection::connect(test_config(), now).unwrap();
+        conn.poll_transmit(now).unwrap();
+        let mut syn_ack = vec![0, 0, 0, 0, 0, 64, 16, 5, 48, 29, 123, 125, 4, 208, 4, 208, 0, 1, 1, 1];
+        conn.handle_datagram(&mut syn_ack, now).unwrap();
+        conn.poll_transmit(now).unwrap();
+        assert_eq!(conn.poll_event(), Some(Event::Connected));
+
+        for index in 0..131_075u64 {
+            let data = index.to_le_bytes().to_vec();
+            conn.process_data(
+                &DataHeader {
+                    data_seq_num: seq::truncate_seq(index),
+                },
+                &DataBody {
+                    channel_seq_num: u16::try_from(index % 65_535 + 1).unwrap(),
+                    data: data.clone(),
+                },
+                now,
+            );
+            assert_eq!(conn.poll_event(), Some(Event::DataReceived(data)), "packet {index}");
+            conn.poll_transmit(now).expect("acknowledgment advances receive window");
+        }
+    }
 
     #[test]
     fn windows_v3_handshake_uses_zero_based_data_and_one_based_channel_seq() {

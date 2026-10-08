@@ -54,6 +54,9 @@ pub(crate) struct RecvWindow {
     /// Next ChannelSeqNum expected for in-order delivery.
     next_channel_seq: u64,
 
+    /// Windows RDP-UDP2 skips wire channel zero (MS-RDPEUDP2 Appendix A, note 1).
+    skip_zero_channel_seq: bool,
+
     /// Out-of-order data buffered by ChannelSeqNum, waiting for gaps to fill.
     reorder_buf: BTreeMap<u64, Vec<u8>>,
 
@@ -74,6 +77,7 @@ impl RecvWindow {
             base_seq: initial_data_seq,
             highest_seq: initial_data_seq.saturating_sub(1),
             next_channel_seq: initial_channel_seq,
+            skip_zero_channel_seq: false,
             reorder_buf: BTreeMap::new(),
             max_entries,
         }
@@ -229,6 +233,9 @@ impl RecvWindow {
         while let Some(data) = self.reorder_buf.remove(&self.next_channel_seq) {
             delivered.push(data);
             self.next_channel_seq += 1;
+            if self.skip_zero_channel_seq && self.next_channel_seq & 0xFFFF == 0 {
+                self.next_channel_seq += 1;
+            }
         }
 
         if !delivered.is_empty() {
@@ -347,6 +354,11 @@ impl RecvWindow {
         self.highest_seq
     }
 
+    /// Use the Windows RDP-UDP2 channel sequence space; legacy UDP keeps zero.
+    pub(crate) fn use_nonzero_channel_seq(&mut self) {
+        self.skip_zero_channel_seq = true;
+    }
+
     /// The next ChannelSeqNum expected for in-order delivery.
     pub(crate) fn next_channel_seq(&self) -> u64 {
         self.next_channel_seq
@@ -367,6 +379,24 @@ impl RecvWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_v3_reorders_across_channel_wrap_without_dummy_channel_zero() {
+        let mut window = RecvWindow::new(10, 65_534, 6);
+        window.use_nonzero_channel_seq();
+        assert!(window.receive(12, 65_537, vec![3]));
+        assert!(window.receive(11, 65_535, vec![2]));
+        assert!(window.receive_without_payload(13));
+        assert!(window.drain_ordered().is_empty());
+        assert!(window.receive(10, 65_534, vec![1]));
+        assert_eq!(window.drain_ordered(), vec![vec![1], vec![2], vec![3]]);
+        assert_eq!(window.next_channel_seq(), 65_538);
+
+        let mut legacy = RecvWindow::new(10, 65_535, 6);
+        assert!(legacy.receive(11, 65_536, vec![2]));
+        assert!(legacy.receive(10, 65_535, vec![1]));
+        assert_eq!(legacy.drain_ordered(), vec![vec![1], vec![2]]);
+    }
 
     #[test]
     fn new_window_state() {

@@ -88,6 +88,9 @@ pub(crate) struct SendWindow {
     /// Next ChannelSeqNum to assign to new (non-retransmit) data.
     next_channel_seq: u64,
 
+    /// Windows RDP-UDP2 skips wire channel zero (MS-RDPEUDP2 Appendix A, note 1).
+    skip_zero_channel_seq: bool,
+
     /// Total bytes currently in flight (state == Pending).
     bytes_in_flight: u64,
 
@@ -108,6 +111,7 @@ impl SendWindow {
             data_store: VecDeque::with_capacity(max_entries),
             next_data_seq: initial_data_seq,
             next_channel_seq: initial_channel_seq,
+            skip_zero_channel_seq: false,
             bytes_in_flight: 0,
             max_entries,
         }
@@ -138,6 +142,11 @@ impl SendWindow {
     /// The next DataSeqNum that will be assigned.
     pub(crate) fn next_data_seq(&self) -> u64 {
         self.next_data_seq
+    }
+
+    /// Use the Windows RDP-UDP2 channel sequence space; legacy UDP keeps zero.
+    pub(crate) fn use_nonzero_channel_seq(&mut self) {
+        self.skip_zero_channel_seq = true;
     }
 
     /// The next ChannelSeqNum that will be assigned to new data.
@@ -173,6 +182,9 @@ impl SendWindow {
 
         self.next_data_seq += 1;
         self.next_channel_seq += 1;
+        if self.skip_zero_channel_seq && self.next_channel_seq & 0xFFFF == 0 {
+            self.next_channel_seq += 1;
+        }
         self.bytes_in_flight += u64::try_from(size).expect("packet size fits in u64");
 
         Some((data_seq, channel_seq))
@@ -367,6 +379,19 @@ mod tests {
     use core::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn only_windows_v3_channels_skip_zero_at_wrap() {
+        for (skip_zero, next) in [(true, 65_537), (false, 65_536)] {
+            let mut window = SendWindow::new(65_535, 65_535, 6);
+            if skip_zero {
+                window.use_nonzero_channel_seq();
+            }
+            let now = MonotonicInstant::from_millis(0);
+            assert_eq!(window.push(vec![1], now), Some((65_535, 65_535)));
+            assert_eq!(window.push(vec![2], now), Some((65_536, next)));
+        }
+    }
 
     fn now() -> MonotonicInstant {
         MonotonicInstant::from_millis(0)

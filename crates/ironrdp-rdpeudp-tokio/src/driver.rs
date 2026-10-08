@@ -517,6 +517,8 @@ mod tests {
     /// never reach a real multitransport request, so any value will do.
     fn test_connection_config() -> ConnectionConfig {
         ConnectionConfig {
+            // Keep the send-buffer backpressure tests at their 64-slot bound.
+            log_window_size: 6,
             cookie_hash: Some([0x5A; 32]),
             ..ConnectionConfig::default()
         }
