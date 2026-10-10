@@ -974,6 +974,22 @@ impl TileState {
         srl_data: [&[u8]; 3],
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
+        quality: u8,
+    ) -> Result<(), SrlError> {
+        self.decode_upgrade_with_base(
+            srl_data,
+            raw_data,
+            prog_quants,
+            self.last_upgrade_base_quant,
+            quality,
+        )
+    }
+
+    fn decode_upgrade_with_base(
+        &mut self,
+        srl_data: [&[u8]; 3],
+        raw_data: [&[u8]; 3],
+        prog_quants: [ComponentCodecQuant; 3],
         next_base_quant: [ComponentCodecQuant; 3],
         quality: u8,
     ) -> Result<(), SrlError> {
@@ -1811,7 +1827,7 @@ fn decode_tile_block(
                 &[pq.y_quant, pq.cb_quant, pq.cr_quant],
             )?;
 
-            tile_state.decode_upgrade(
+            tile_state.decode_upgrade_with_base(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
@@ -2194,7 +2210,6 @@ mod tests {
                 [&[0x90, 0x00], &[0x80, 0x00], &[]],
                 [&[], &[], &[]],
                 [ComponentCodecQuant::LOSSLESS; 3],
-                tile.last_upgrade_base_quant,
                 75,
             ),
             Err(SrlError::Truncated)
@@ -2302,7 +2317,7 @@ mod tests {
         tile.pass = 1;
         let mut newer_base = tile.base_quant;
         newer_base[0].hl1 = newer_base[0].hl1.saturating_add(1);
-        tile.decode_upgrade(
+        tile.decode_upgrade_with_base(
             [&[], &[], &[]],
             [&[], &[], &[]],
             [ComponentCodecQuant::LOSSLESS; 3],
