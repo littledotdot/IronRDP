@@ -2269,7 +2269,8 @@ mod tests {
             &[],
             false,
         )
-        .unwrap_err();
+        .err()
+        .expect("invalid quantization must reject the upgrade");
         assert!(matches!(
             error,
             ProgressiveDecodeError::InvalidUpgradeQuantization {
