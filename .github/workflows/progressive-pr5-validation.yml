@@ -1,0 +1,25 @@
+name: Progressive PR5 targeted verification
+on:
+  push:
+    branches:
+      - ci/progressive-pr5-verify
+permissions:
+  contents: read
+jobs:
+  targeted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain (repository rust-toolchain.toml)
+        run: rustup show active-toolchain
+      - name: Rust format
+        run: cargo fmt --all -- --check
+      - name: Progressive codec tests
+        run: cargo test --locked -p ironrdp-graphics --lib
+      - name: RDP PDU tests
+        run: cargo test --locked -p ironrdp-pdu --lib
+      - name: EGFX tests
+        run: cargo test --locked -p ironrdp-egfx --lib
+      - name: Targeted clippy
+        run: cargo clippy --locked -p ironrdp-graphics -p ironrdp-pdu -p ironrdp-egfx --lib -- -D warnings
