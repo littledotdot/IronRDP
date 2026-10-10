@@ -969,28 +969,8 @@ impl TileState {
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
-    ) -> Result<(), ProgressiveDecodeError> {
+    ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
-
-        // FreeRDP's progressive_rfx_quant_sub rejects a quality regression.
-        // Saturating a negative delta to zero would silently accept an
-        // invalid upgrade and replace the reference quantization, making
-        // later (otherwise valid) refinements decode against the wrong state.
-        // Validate all components and bands before touching tile state.
-        for (component, (previous, next)) in prev_prog_quant.iter().zip(prog_quants.iter()).enumerate() {
-            for band in 0..NUM_BANDS {
-                let previous_bit_pos = previous.for_band(band);
-                let next_bit_pos = next.for_band(band);
-                if next_bit_pos > previous_bit_pos {
-                    return Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
-                        component,
-                        band,
-                        previous: previous_bit_pos,
-                        next: next_bit_pos,
-                    });
-                }
-            }
-        }
 
         let mut coefficients = self.coefficients;
         let mut sign = self.sign;
@@ -1210,8 +1190,8 @@ pub enum ProgressiveDecodeError {
     InvalidUpgradeQuantization {
         component: usize,
         band: usize,
-        previous: u8,
-        next: u8,
+        previous: u16,
+        next: u16,
     },
     /// A difference tile has no previously decoded state to use as its reference.
     MissingTileReference { x_idx: u16, y_idx: u16 },
@@ -1268,6 +1248,35 @@ impl From<SrlError> for ProgressiveDecodeError {
     fn from(e: SrlError) -> Self {
         Self::Srl(e)
     }
+}
+
+/// Match FreeRDP's progressive_rfx_quant_sub: BitPos includes both the
+/// region's base quantization and the progressive quantization. Checking
+/// progressive quant alone rejects valid upgrades if the base changes.
+fn validate_upgrade_quantization(
+    previous_base: &[ComponentCodecQuant; 3],
+    previous_progressive: &[ComponentCodecQuant; 3],
+    next_base: &[ComponentCodecQuant; 3],
+    next_progressive: &[ComponentCodecQuant; 3],
+) -> Result<(), ProgressiveDecodeError> {
+    for component in 0..3 {
+        for band in 0..NUM_BANDS {
+            let previous =
+                u16::from(previous_base[component].for_band(band))
+                + u16::from(previous_progressive[component].for_band(band));
+            let next = u16::from(next_base[component].for_band(band))
+                + u16::from(next_progressive[component].for_band(band));
+            if next > previous {
+                return Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                    component,
+                    band,
+                    previous,
+                    next,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), ProgressiveDecodeError> {
@@ -1767,6 +1776,32 @@ fn decode_tile_block(
             }
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
+            let next_base = [
+                *quant_vals.get(usize::from(tile.quant_idx_y)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_y),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cb)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cb),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cr)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cr),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+            ];
+            validate_upgrade_quantization(
+                &tile_state.base_quant,
+                &tile_state.prog_quant,
+                &next_base,
+                &[pq.y_quant, pq.cb_quant, pq.cr_quant],
+            )?;
 
             tile_state.decode_upgrade(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
@@ -2173,24 +2208,19 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_rejects_quality_regression_before_modifying_tile() {
-        let mut tile = TileState::new();
-        tile.pass = 1;
-        tile.coefficients[0][0] = 137;
-        tile.sign[0][0] = SIGN_POSITIVE;
-
-        // A larger BitPos means coarser quality. FreeRDP rejects it rather
-        // than consuming the stream as a zero-bit upgrade.
+    fn upgrade_rejects_non_monotonic_effective_bit_position() {
+        let base = [ComponentCodecQuant::LOSSLESS; 3];
+        let previous_prog = [ComponentCodecQuant::LOSSLESS; 3];
         let mut coarser = ComponentCodecQuant::LOSSLESS;
         coarser.hl1 = 1;
-        let error = tile
-            .decode_upgrade(
-                [&[], &[], &[]],
-                [&[], &[], &[]],
-                [coarser, ComponentCodecQuant::LOSSLESS, ComponentCodecQuant::LOSSLESS],
-                1,
-            )
-            .unwrap_err();
+
+        let error = validate_upgrade_quantization(
+            &base,
+            &previous_prog,
+            &base,
+            &[coarser, ComponentCodecQuant::LOSSLESS, ComponentCodecQuant::LOSSLESS],
+        )
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -2201,11 +2231,35 @@ mod tests {
                 next: 1
             }
         ));
-        assert_eq!(tile.pass, 1);
-        assert_eq!(tile.quality, 0);
-        assert_eq!(tile.coefficients[0][0], 137);
-        assert_eq!(tile.sign[0][0], SIGN_POSITIVE);
-        assert_eq!(tile.prog_quant[0].hl1, 0);
+    }
+
+    #[test]
+    fn upgrade_compares_total_bit_position_when_base_quant_changes() {
+        let mut previous_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut previous_prog = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut next_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let next_prog = [ComponentCodecQuant::LOSSLESS; 3];
+
+        previous_base[0].hl1 = 6;
+        previous_prog[0].hl1 = 2;
+        next_base[0].hl1 = 7;
+        // Effective BitPos goes from 8 to 7, so the upgrade is valid even
+        // though the base quantization value increases.
+        assert!(validate_upgrade_quantization(
+            &previous_base, &previous_prog, &next_base, &next_prog
+        ).is_ok());
+
+        next_base[0].hl1 = 9;
+        assert!(matches!(
+            validate_upgrade_quantization(
+                &previous_base, &previous_prog, &next_base, &next_prog
+            ),
+            Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                previous: 8,
+                next: 9,
+                ..
+            })
+        ));
     }
 
     #[test]
