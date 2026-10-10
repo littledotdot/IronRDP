@@ -123,7 +123,7 @@ struct EndpointState {
 ///
 /// Construct this before building an RDP [`ironrdp_client::config::Config`], inject
 /// [`Self::dvc_proxy_info`] into its builder, and retain the value for the lifetime of that
-/// session. It intentionally does no I/O until [`Self::handle`] is first called.
+/// session. Start negotiation when connecting the RDP session, before the remote agent's deadline.
 pub struct NowEndpoint {
     pipe_name: String,
     state: Mutex<EndpointState>,
@@ -169,6 +169,17 @@ impl NowEndpoint {
     /// Returns the local endpoint name. Windows returns the intentionally unqualified pipe name.
     pub fn pipe_name(&self) -> &str {
         &self.pipe_name
+    }
+
+    /// Negotiate in the background: the Windows agent exits after five seconds without a peer.
+    /// A missing optional NOW agent must not delay the RDP connection or framebuffer.
+    pub fn start_negotiation(self: &std::sync::Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let endpoint = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            if let Err(error) = endpoint.handle().await {
+                tracing::debug!(%error, "Optional NOW session negotiation unavailable");
+            }
+        })
     }
 
     /// Gets the cached handle or waits for the DVC proxy, connects it, and negotiates NOW.
@@ -374,6 +385,23 @@ mod tests {
     fn connection_deadlines_match_the_reconnect_policy() {
         assert_eq!(INITIAL_ENDPOINT_TIMEOUT, Duration::from_secs(30));
         assert_eq!(RECONNECT_ENDPOINT_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_negotiates_before_the_first_command() {
+        let endpoint = std::sync::Arc::new(NowEndpoint::new().expect("allocate endpoint"));
+        let listener = tokio::net::UnixListener::bind(endpoint.pipe_name()).expect("bind proxy");
+        let negotiation = endpoint.start_negotiation();
+        let (mut peer, _) = tokio::time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("negotiation must start without a command")
+            .expect("accept client");
+        let _ = read_message(&mut peer).await;
+        write_message(&mut peer, NowChannelCapsetMsg::default()).await;
+        negotiation.await.expect("background negotiation completes");
+        assert!(endpoint.diagnostic_snapshot().await.0);
+        std::fs::remove_file(endpoint.pipe_name()).expect("remove test socket");
     }
 
     #[tokio::test]

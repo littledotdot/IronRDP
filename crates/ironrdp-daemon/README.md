@@ -24,4 +24,7 @@ This integration build includes the client `udp` feature. Set connect/overlay pr
 `ironrdp_udp_transport:i:1` to request reliable UDP multitransport, or `:0` for TCP.
 Unsupported transports and failed bootstrap keep TCP; migrated-channel loss reconnects.
 FrameStream uses request tag 41 and BGR24 payload tag 18, with one-byte credits.
+While waiting for a new framebuffer, it also reads the IPC connection so a disconnected
+consumer releases its handler and socket immediately. Queued credits remain valid and
+never cause duplicate frames while the framebuffer is unchanged.
 Update Wendao and the agent together, then restart the daemon.

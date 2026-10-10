@@ -205,9 +205,14 @@ where
             // asks again before RDP produced another frame, wait on the watch
             // channel instead of re-encoding and re-sending the same BGR24 frame.
             let mut last_sent_sequence = 0u64;
+            let mut pending_credits = 0usize;
             'frame_stream: loop {
-                let credit = stream.read_u8().await?;
-                anyhow::ensure!(credit == 1, "invalid frame credit");
+                if pending_credits == 0 {
+                    let credit = stream.read_u8().await?;
+                    anyhow::ensure!(credit == 1, "invalid frame credit");
+                } else {
+                    pending_credits -= 1;
+                }
 
                 loop {
                     let sequence = *frames.borrow_and_update();
@@ -216,8 +221,17 @@ where
                         last_sent_sequence = sequence;
                         break;
                     }
-                    if frames.changed().await.is_err() {
-                        break 'frame_stream;
+                    tokio::select! {
+                        changed = frames.changed() => {
+                            if changed.is_err() {
+                                break 'frame_stream;
+                            }
+                        }
+                        credit = stream.read_u8() => {
+                            // EOF must release idle subscriptions without another frame.
+                            anyhow::ensure!(credit? == 1, "invalid frame credit");
+                            pending_credits = pending_credits.checked_add(1).context("too many frame credits")?;
+                        }
                     }
                 }
             }
@@ -1169,6 +1183,8 @@ impl Daemon {
         ));
 
         info!(%destination, "Started RDP session");
+
+        now_endpoint.start_negotiation();
 
         *self.state.lock().expect("daemon state poisoned") = Some(Session {
             input_tx,
@@ -2887,6 +2903,146 @@ mod tests {
             now_endpoint,
         });
         (daemon, input_rx, live, rail_notify)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frame_stream_closed_clients_release_idle_handlers() {
+        use std::os::fd::AsRawFd as _;
+        use tokio::io::AsyncWriteExt as _;
+
+        let (daemon, _input_rx, live, _) = active_rail_session(false);
+        let (frame_tx, frame_rx) = watch::channel(1u64);
+        daemon
+            .state
+            .lock()
+            .expect("daemon state poisoned")
+            .as_mut()
+            .expect("session")
+            .frame_rx = frame_rx;
+        live.lock().expect("session live state poisoned").frame = Some(Arc::new(super::Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![0x0011_2233],
+        }));
+        let daemon = Arc::new(daemon);
+        let mut handlers = Vec::new();
+        let mut socket_fds = Vec::new();
+        let mut retained = Vec::new();
+        for attempt in 1..=100 {
+            let (mut client, server) = tokio::net::UnixStream::pair().expect("IPC socket pair");
+            socket_fds.push(server.as_raw_fd());
+            let owner = Arc::clone(&daemon);
+            handlers.push(tokio::spawn(
+                async move { super::handle_connection(server, &owner).await },
+            ));
+            crate::transport::write_message(&mut client, &Request::FrameStream)
+                .await
+                .expect("subscribe");
+            let response: Response = crate::transport::read_message(&mut client).await.expect("handshake");
+            assert!(response.is_ok());
+            client.write_u8(1).await.expect("first credit");
+            let response: Response = crate::transport::read_message(&mut client).await.expect("first frame");
+            assert!(matches!(response, Response::Ok(Payload::Frame { sequence: 1, .. })));
+            client.write_u8(1).await.expect("wait for next frame");
+            tokio::task::yield_now().await;
+            drop(client);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            if matches!(attempt, 1 | 10 | 100) {
+                retained.push((attempt, frame_tx.receiver_count() - 1));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let remaining = handlers.iter().filter(|handler| !handler.is_finished()).count();
+        let receivers = frame_tx.receiver_count() - 1;
+        socket_fds.sort_unstable();
+        socket_fds.dedup();
+        // SAFETY: F_GETFD queries a descriptor and does not dereference memory.
+        let open_sockets = socket_fds
+            .iter()
+            .filter(|&&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+            .count();
+        // A frame change should also release abandoned subscriptions on the old implementation.
+        frame_tx.send_replace(2);
+        for mut handler in handlers {
+            let _ = tokio::time::timeout(Duration::from_secs(1), &mut handler)
+                .await
+                .expect("handler cleanup")
+                .expect("task");
+        }
+        assert_eq!(frame_tx.receiver_count(), 1);
+        // SAFETY: F_GETFD queries a descriptor and does not dereference memory.
+        let after_update = socket_fds
+            .iter()
+            .filter(|&&fd| unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+            .count();
+        assert_eq!(after_update, 0);
+        assert_eq!(
+            remaining, 0,
+            "idle handler accumulation: checkpoints={retained:?}, receivers={receivers}, open_sockets={open_sockets}, after_update={after_update}"
+        );
+        assert_eq!(open_sockets, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn frame_stream_preserves_queued_credits_and_waits_for_changes() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (daemon, _input_rx, live, _) = active_rail_session(false);
+        let (frame_tx, frame_rx) = watch::channel(0u64);
+        daemon
+            .state
+            .lock()
+            .expect("daemon state poisoned")
+            .as_mut()
+            .expect("session")
+            .frame_rx = frame_rx;
+        live.lock().expect("session live state poisoned").frame = Some(Arc::new(super::Frame {
+            width: 1,
+            height: 1,
+            pixels: vec![0x0011_2233],
+        }));
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("IPC socket pair");
+        let handler = tokio::spawn(async move { super::handle_connection(server, &daemon).await });
+        crate::transport::write_message(&mut client, &Request::FrameStream)
+            .await
+            .expect("subscribe");
+        let response: Response = crate::transport::read_message(&mut client).await.expect("handshake");
+        assert!(response.is_ok());
+        client.write_all(&[1, 1, 1]).await.expect("queued credits");
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(10),
+                crate::transport::read_message::<_, Response>(&mut client)
+            )
+            .await
+            .is_err()
+        );
+        for sequence in 1..=3 {
+            frame_tx.send_replace(sequence);
+            let response: Response =
+                tokio::time::timeout(Duration::from_secs(1), crate::transport::read_message(&mut client))
+                    .await
+                    .expect("frame timeout")
+                    .expect("frame");
+            assert!(matches!(response, Response::Ok(Payload::Frame { sequence: actual, .. }) if actual == sequence));
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(10),
+                    crate::transport::read_message::<_, Response>(&mut client)
+                )
+                .await
+                .is_err()
+            );
+        }
+        client.write_all(&[1, 2]).await.expect("invalid queued credit");
+        let error = tokio::time::timeout(Duration::from_secs(1), handler)
+            .await
+            .expect("handler timeout")
+            .expect("task")
+            .expect_err("reject invalid credit");
+        assert_eq!(error.to_string(), "invalid frame credit");
     }
 
     #[test]
