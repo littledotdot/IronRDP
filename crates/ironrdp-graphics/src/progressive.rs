@@ -830,6 +830,9 @@ pub struct TileState {
     pub quant_idx: [u8; 3],
     /// Base quantization tables (Y, Cb, Cr) used when reconstructing pixels.
     pub base_quant: [ComponentCodecQuant; 3],
+    /// Base quantization from the latest successful pass. Kept separate from
+    /// the first-pass reconstruction quantization for protocol validation.
+    pub last_upgrade_base_quant: [ComponentCodecQuant; 3],
     /// Progressive pass counter (0 = no data, 1 = first pass complete, 2+ = upgrade).
     pub pass: u16,
     /// Whether the tile was encoded as a difference tile.
@@ -849,23 +852,25 @@ struct FirstPassOptions {
 impl TileState {
     /// Create a new tile with zeroed state.
     pub fn new() -> Self {
+        let base_quant = [ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        }; 3];
         Self {
             coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
             quant_idx: [0; 3],
-            base_quant: [ComponentCodecQuant {
-                ll3: 6,
-                hl3: 6,
-                lh3: 6,
-                hh3: 6,
-                hl2: 6,
-                lh2: 6,
-                hh2: 6,
-                hl1: 6,
-                lh1: 6,
-                hh1: 6,
-            }; 3],
+            base_quant,
+            last_upgrade_base_quant: base_quant,
             pass: 0,
             is_difference: false,
             quality: 0,
@@ -946,6 +951,7 @@ impl TileState {
         self.quality = options.quality;
         self.quant_idx = options.quant_idx;
         self.base_quant = [*base_quants[0], *base_quants[1], *base_quants[2]];
+        self.last_upgrade_base_quant = self.base_quant;
         self.use_reduce_extrapolate = options.use_reduce_extrapolate;
         self.is_difference = reference.is_some();
         self.prog_quant = prog_quants;
@@ -968,6 +974,7 @@ impl TileState {
         srl_data: [&[u8]; 3],
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
+        next_base_quant: [ComponentCodecQuant; 3],
         quality: u8,
     ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
@@ -990,6 +997,7 @@ impl TileState {
         self.coefficients = coefficients;
         self.sign = sign;
         self.prog_quant = prog_quants;
+        self.last_upgrade_base_quant = next_base_quant;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
 
@@ -1797,7 +1805,7 @@ fn decode_tile_block(
                 )?,
             ];
             validate_upgrade_quantization(
-                &tile_state.base_quant,
+                &tile_state.last_upgrade_base_quant,
                 &tile_state.prog_quant,
                 &next_base,
                 &[pq.y_quant, pq.cb_quant, pq.cr_quant],
@@ -1807,6 +1815,7 @@ fn decode_tile_block(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                next_base,
                 tile.quality,
             )?;
             references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
@@ -2185,6 +2194,7 @@ mod tests {
                 [&[0x90, 0x00], &[0x80, 0x00], &[]],
                 [&[], &[], &[]],
                 [ComponentCodecQuant::LOSSLESS; 3],
+                tile.last_upgrade_base_quant,
                 75,
             ),
             Err(SrlError::Truncated)
@@ -2193,6 +2203,7 @@ mod tests {
         assert_eq!(tile.coefficients, coefficients);
         assert_eq!(tile.sign, sign);
         assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.last_upgrade_base_quant, tile.base_quant);
         assert_eq!(tile.pass, 1);
         assert_eq!(tile.quality, 50);
     }
@@ -2283,6 +2294,24 @@ mod tests {
         assert_eq!(retained.pass, 1);
         assert_eq!(retained.coefficients[0][0], 42);
         assert!(references.is_empty());
+    }
+
+    #[test]
+    fn upgrade_tracks_base_quant_from_last_successful_pass() {
+        let mut tile = TileState::new();
+        tile.pass = 1;
+        let mut newer_base = tile.base_quant;
+        newer_base[0].hl1 = newer_base[0].hl1.saturating_add(1);
+        tile.decode_upgrade(
+            [&[], &[], &[]],
+            [&[], &[], &[]],
+            [ComponentCodecQuant::LOSSLESS; 3],
+            newer_base,
+            0xFF,
+        )
+        .unwrap();
+        assert_eq!(tile.last_upgrade_base_quant[0].hl1, newer_base[0].hl1);
+        assert_eq!(tile.base_quant[0].hl1, 6);
     }
 
     #[test]
