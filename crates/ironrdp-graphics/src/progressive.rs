@@ -830,6 +830,9 @@ pub struct TileState {
     pub quant_idx: [u8; 3],
     /// Base quantization tables (Y, Cb, Cr) used when reconstructing pixels.
     pub base_quant: [ComponentCodecQuant; 3],
+    /// Base quantization from the latest successful pass. Kept separate from
+    /// the first-pass reconstruction quantization for protocol validation.
+    pub last_upgrade_base_quant: [ComponentCodecQuant; 3],
     /// Progressive pass counter (0 = no data, 1 = first pass complete, 2+ = upgrade).
     pub pass: u16,
     /// Whether the tile was encoded as a difference tile.
@@ -849,23 +852,25 @@ struct FirstPassOptions {
 impl TileState {
     /// Create a new tile with zeroed state.
     pub fn new() -> Self {
+        let base_quant = [ComponentCodecQuant {
+            ll3: 6,
+            hl3: 6,
+            lh3: 6,
+            hh3: 6,
+            hl2: 6,
+            lh2: 6,
+            hh2: 6,
+            hl1: 6,
+            lh1: 6,
+            hh1: 6,
+        }; 3];
         Self {
             coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
             prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
             quant_idx: [0; 3],
-            base_quant: [ComponentCodecQuant {
-                ll3: 6,
-                hl3: 6,
-                lh3: 6,
-                hh3: 6,
-                hl2: 6,
-                lh2: 6,
-                hh2: 6,
-                hl1: 6,
-                lh1: 6,
-                hh1: 6,
-            }; 3],
+            base_quant,
+            last_upgrade_base_quant: base_quant,
             pass: 0,
             is_difference: false,
             quality: 0,
@@ -946,6 +951,7 @@ impl TileState {
         self.quality = options.quality;
         self.quant_idx = options.quant_idx;
         self.base_quant = [*base_quants[0], *base_quants[1], *base_quants[2]];
+        self.last_upgrade_base_quant = self.base_quant;
         self.use_reduce_extrapolate = options.use_reduce_extrapolate;
         self.is_difference = reference.is_some();
         self.prog_quant = prog_quants;
@@ -970,7 +976,27 @@ impl TileState {
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
     ) -> Result<(), SrlError> {
+        self.decode_upgrade_with_base(
+            srl_data,
+            raw_data,
+            prog_quants,
+            self.last_upgrade_base_quant,
+            self.use_reduce_extrapolate,
+            quality,
+        )
+    }
+
+    fn decode_upgrade_with_base(
+        &mut self,
+        srl_data: [&[u8]; 3],
+        raw_data: [&[u8]; 3],
+        prog_quants: [ComponentCodecQuant; 3],
+        next_base_quant: [ComponentCodecQuant; 3],
+        use_reduce_extrapolate: bool,
+        quality: u8,
+    ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
+
         let mut coefficients = self.coefficients;
         let mut sign = self.sign;
 
@@ -980,7 +1006,7 @@ impl TileState {
                 raw_data[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
-                self.use_reduce_extrapolate,
+                use_reduce_extrapolate,
                 &mut coefficients[c],
                 &mut sign[c],
             )?;
@@ -989,6 +1015,8 @@ impl TileState {
         self.coefficients = coefficients;
         self.sign = sign;
         self.prog_quant = prog_quants;
+        self.last_upgrade_base_quant = next_base_quant;
+        self.use_reduce_extrapolate = use_reduce_extrapolate;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
 
@@ -1059,6 +1087,9 @@ impl Default for TileState {
 /// Tiles are lazily allocated on first access to avoid upfront memory
 /// cost for surfaces that only partially receive progressive updates.
 pub struct SurfaceTiles {
+    /// Original dimensions matter even when a resize stays in the same tile grid.
+    pub width_pixels: u16,
+    pub height_pixels: u16,
     /// Width of the surface in tiles (ceildiv of pixel width by 64).
     pub tiles_wide: u16,
     /// Height of the surface in tiles.
@@ -1094,6 +1125,8 @@ impl SurfaceTiles {
         let count = usize::from(tiles_wide) * usize::from(tiles_high);
 
         Ok(Self {
+            width_pixels,
+            height_pixels,
             tiles_wide,
             tiles_high,
             use_reduce_extrapolate,
@@ -1185,6 +1218,13 @@ pub enum ProgressiveDecodeError {
     TileOutOfBounds { x_idx: u16, y_idx: u16 },
     /// Region references a quant index beyond the table.
     InvalidQuantIndex { index: usize, table_len: usize },
+    /// Progressive refinement may only reveal more bits, never discard known bits.
+    InvalidUpgradeQuantization {
+        component: usize,
+        band: usize,
+        previous: u16,
+        next: u16,
+    },
     /// A difference tile has no previously decoded state to use as its reference.
     MissingTileReference { x_idx: u16, y_idx: u16 },
     /// Surface dimensions exceed [`MAX_SURFACE_DIM`] per axis.
@@ -1203,6 +1243,12 @@ impl core::fmt::Display for ProgressiveDecodeError {
             }
             Self::InvalidQuantIndex { index, table_len } => {
                 write!(f, "quant index {index} exceeds table length {table_len}")
+            }
+            Self::InvalidUpgradeQuantization { component, band, previous, next } => {
+                write!(
+                    f,
+                    "progressive upgrade component {component} band {band} regresses from bit position {previous} to {next}"
+                )
             }
             Self::MissingTileReference { x_idx, y_idx } => {
                 write!(f, "difference tile ({x_idx}, {y_idx}) has no retained reference")
@@ -1234,6 +1280,35 @@ impl From<SrlError> for ProgressiveDecodeError {
     fn from(e: SrlError) -> Self {
         Self::Srl(e)
     }
+}
+
+/// Match FreeRDP's progressive_rfx_quant_sub: BitPos includes both the
+/// region's base quantization and the progressive quantization. Checking
+/// progressive quant alone rejects valid upgrades if the base changes.
+fn validate_upgrade_quantization(
+    previous_base: &[ComponentCodecQuant; 3],
+    previous_progressive: &[ComponentCodecQuant; 3],
+    next_base: &[ComponentCodecQuant; 3],
+    next_progressive: &[ComponentCodecQuant; 3],
+) -> Result<(), ProgressiveDecodeError> {
+    for component in 0..3 {
+        for band in 0..NUM_BANDS {
+            let previous =
+                u16::from(previous_base[component].for_band(band))
+                + u16::from(previous_progressive[component].for_band(band));
+            let next = u16::from(next_base[component].for_band(band))
+                + u16::from(next_progressive[component].for_band(band));
+            if next > previous {
+                return Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                    component,
+                    band,
+                    previous,
+                    next,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), ProgressiveDecodeError> {
@@ -1289,7 +1364,9 @@ pub struct ProgressiveDecoder {
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
     frame_tiles: BTreeMap<(u16, u32), BTreeSet<(u16, u16)>>,
     frame_active: bool,
-    surface_context_flags: BTreeMap<u16, bool>,
+    // Windows may omit CONTEXT when opening another codec context on the
+    // same surface. Presence, not CONTEXT flags, is what may be reused.
+    surfaces_with_context: BTreeSet<u16>,
 }
 
 impl ProgressiveDecoder {
@@ -1300,7 +1377,7 @@ impl ProgressiveDecoder {
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
-            surface_context_flags: BTreeMap::new(),
+            surfaces_with_context: BTreeSet::new(),
         }
     }
 
@@ -1339,37 +1416,19 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract the band-layout flag from the CONTEXT block when present.
-        // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
-        // context once (keyed by `(surface_id, codec_context_id)`) and are not
-        // required to be
-        // repeated on subsequent frames that reference the same context.
-        // Real-world servers (xrdp, GNOME Remote Desktop) omit the CONTEXT
-        // block on every frame after the first one that established the
-        // context. The strict requirement rejected each of those frames with
-        // `MissingBlock("CONTEXT")`, freezing the image on the coarse first
-        // pass.
-        //
-        // Fall back to the value stored when the context was first created, then to the last
-        // one this surface described: Windows opens a new codec context id mid-session,
-        // deletes the previous one, and never repeats SYNC + CONTEXT, so a per-context lookup
-        // alone rejects the new context. The retained value is scoped to its surface and
-        // released with it. Only error when no source is available at all.
-        let signalled = blocks.iter().find_map(|block| match block {
-            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-            _ => None,
-        });
-        if let Some(flag) = signalled {
-            self.surface_context_flags.insert(surface_id, flag);
+        // CONTEXT flags describe codec capabilities such as SUBBAND_DIFFING;
+        // the per-REGION flags select the reduce-extrapolate DWT layout.
+        // Remember that a context was established without reusing its flags as
+        // the REGION mode. Windows and other servers may omit repeated CONTEXT
+        // blocks, including when allocating another codec context on a surface.
+        if blocks.iter().any(|block| matches!(block, ProgressiveBlock::Context(_))) {
+            self.surfaces_with_context.insert(surface_id);
         }
-        let use_reduce_extrapolate = signalled
-            .or_else(|| {
-                self.contexts
-                    .get(&(surface_id, codec_context_id))
-                    .map(|c| c.surface.use_reduce_extrapolate)
-            })
-            .or_else(|| self.surface_context_flags.get(&surface_id).copied())
-            .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
+        if !self.contexts.contains_key(&(surface_id, codec_context_id))
+            && !self.surfaces_with_context.contains(&surface_id)
+        {
+            return Err(ProgressiveDecodeError::MissingBlock("CONTEXT"));
+        }
 
         // Direct users of the decoder get one self-contained frame per call.
         // The EGFX client brackets multiple payloads with begin_frame/end_frame.
@@ -1383,21 +1442,20 @@ impl ProgressiveDecoder {
         let context = match contexts.entry((surface_id, codec_context_id)) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+                let surface = SurfaceTiles::new(surface_width, surface_height, false)?;
                 e.insert(ProgressiveContext { surface })
             }
         };
 
-        // If surface dimensions changed, reallocate the codec-context tile grid.
-        let expected_wide = surface_width.div_ceil(TILE_DIM);
-        let expected_high = surface_height.div_ceil(TILE_DIM);
+        // A resize by less than one 64x64 tile still replaces the graphics
+        // surface, so the codec state must not survive merely because its
+        // tile-grid dimensions are unchanged.
         let surface_resized =
-            context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high;
+            context.surface.width_pixels != surface_width || context.surface.height_pixels != surface_height;
         if surface_resized {
-            context.surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+            context.surface = SurfaceTiles::new(surface_width, surface_height, false)?;
+            references.retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         }
-        context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
-
         let frame_tiles = all_frame_tiles.entry((surface_id, codec_context_id)).or_default();
         if surface_resized {
             frame_tiles.clear();
@@ -1426,6 +1484,13 @@ impl ProgressiveDecoder {
                 _ => continue,
             };
 
+            // MS-RDPRFX region flags select the DWT layout. The CONTEXT flag
+            // is SUBBAND_DIFFING, not DWT_REDUCE_EXTRAPOLATE (FreeRDP's
+            // progressive_decompress_tile_first/upgrade uses region->flags).
+            // These flags happen to share bit 0 but have distinct meanings.
+            let region_use_reduce_extrapolate = region.uses_reduce_extrapolate();
+            context.surface.use_reduce_extrapolate = region_use_reduce_extrapolate;
+
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
                 let tiles = decode_tile_block(
@@ -1435,7 +1500,7 @@ impl ProgressiveDecoder {
                     tile_block,
                     &region.quant_vals,
                     &region.quant_prog_vals,
-                    use_reduce_extrapolate,
+                    region_use_reduce_extrapolate,
                 )?;
                 for tile in tiles {
                     let key = (tile.x_idx, tile.y_idx);
@@ -1544,7 +1609,7 @@ impl ProgressiveDecoder {
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         self.frame_tiles
             .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
-        self.surface_context_flags.remove(&surface_id);
+        self.surfaces_with_context.remove(&surface_id);
     }
 
     /// Reset codec-context state while retaining surface sub-band references.
@@ -1733,11 +1798,39 @@ fn decode_tile_block(
             }
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
+            let next_base = [
+                *quant_vals.get(usize::from(tile.quant_idx_y)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_y),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cb)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cb),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cr)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cr),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+            ];
+            validate_upgrade_quantization(
+                &tile_state.last_upgrade_base_quant,
+                &tile_state.prog_quant,
+                &next_base,
+                &[pq.y_quant, pq.cb_quant, pq.cr_quant],
+            )?;
 
-            tile_state.decode_upgrade(
+            tile_state.decode_upgrade_with_base(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                next_base,
+                use_reduce_extrapolate,
                 tile.quality,
             )?;
             references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
@@ -1808,6 +1901,79 @@ mod tests {
         ]);
 
         encode_progressive_stream(&blocks).unwrap()
+    }
+
+    #[test]
+    fn progressive_dwt_mode_comes_from_region_not_context_flags() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, encode_progressive_stream,
+        };
+
+        // CONTEXT bit 0 is SUBBAND_DIFFING; REGION bit 0 selects the
+        // reduce-extrapolate DWT. FreeRDP deliberately reads them separately.
+        for (context_flags, region_flags, expected_mode) in [(1, 0, false), (0, 1, true)] {
+            let base = TileState::new().base_quant[0];
+            let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut encoded = [0u8; 32768];
+            let encoded_len = encode_first_pass(
+                &mut coefficients,
+                &mut encoded,
+                &base,
+                &ComponentCodecQuant::LOSSLESS,
+                expected_mode,
+            )
+            .unwrap();
+            let data = &encoded[..encoded_len];
+
+            let blocks = [
+                ProgressiveBlock::Sync(ProgressiveSyncPdu),
+                ProgressiveBlock::Context(ProgressiveContextPdu {
+                    context_id: 0,
+                    tile_size: 64,
+                    flags: context_flags,
+                }),
+                ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                    frame_index: 0,
+                    region_count: 1,
+                }),
+                ProgressiveBlock::Region(ProgressiveRegion {
+                    tile_size: 64,
+                    rects: vec![RfxRectangle {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                    }],
+                    quant_vals: vec![base],
+                    quant_prog_vals: vec![],
+                    flags: region_flags,
+                    tiles: vec![ProgressiveTile::Simple(TileSimple {
+                        quant_idx_y: 0,
+                        quant_idx_cb: 0,
+                        quant_idx_cr: 0,
+                        x_idx: 0,
+                        y_idx: 0,
+                        flags: 0,
+                        y_data: data,
+                        cb_data: data,
+                        cr_data: data,
+                        tail_data: &[],
+                    })],
+                }),
+                ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+            ];
+            let bitmap = encode_progressive_stream(&blocks).unwrap();
+            let mut decoder = ProgressiveDecoder::new();
+            let decoded = decoder.decode_bitmap(0, 10, 64, 64, &bitmap).unwrap();
+            assert_eq!(decoded.len(), 1);
+            let tile = decoder.contexts.get(&(0, 10)).unwrap().surface.get(0, 0).unwrap();
+            assert_eq!(
+                tile.use_reduce_extrapolate, expected_mode,
+                "context flags {context_flags:#x}, region flags {region_flags:#x}"
+            );
+        }
     }
 
     #[test]
@@ -2124,6 +2290,7 @@ mod tests {
         assert_eq!(tile.coefficients, coefficients);
         assert_eq!(tile.sign, sign);
         assert_eq!(tile.prog_quant, [prev_prog_quant; 3]);
+        assert_eq!(tile.last_upgrade_base_quant, tile.base_quant);
         assert_eq!(tile.pass, 1);
         assert_eq!(tile.quality, 50);
     }
@@ -2136,6 +2303,132 @@ mod tests {
         assert!(!tile.use_reduce_extrapolate);
         assert!(tile.coefficients[0].iter().all(|&v| v == 0));
         assert!(tile.sign[0].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn upgrade_rejects_non_monotonic_effective_bit_position() {
+        let base = [ComponentCodecQuant::LOSSLESS; 3];
+        let previous_prog = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut coarser = ComponentCodecQuant::LOSSLESS;
+        coarser.hl1 = 1;
+
+        let error = validate_upgrade_quantization(
+            &base,
+            &previous_prog,
+            &base,
+            &[coarser, ComponentCodecQuant::LOSSLESS, ComponentCodecQuant::LOSSLESS],
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProgressiveDecodeError::InvalidUpgradeQuantization {
+                component: 0,
+                band: 0,
+                previous: 0,
+                next: 1
+            }
+        ));
+    }
+
+    #[test]
+    fn invalid_upgrade_does_not_corrupt_prior_tile_or_reference() {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileUpgrade};
+
+        let mut surface = SurfaceTiles::new(64, 64, false).unwrap();
+        let tile_state = surface.get_or_create(0, 0).unwrap();
+        tile_state.pass = 1;
+        tile_state.coefficients[0][0] = 42;
+        let mut coarser = tile_state.base_quant[0];
+        coarser.hl1 += 1;
+
+        let upgrade = ProgressiveTile::Upgrade(TileUpgrade {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            quality: 0xFF,
+            y_srl_data: &[],
+            y_raw_data: &[],
+            cb_srl_data: &[],
+            cb_raw_data: &[],
+            cr_srl_data: &[],
+            cr_raw_data: &[],
+        });
+        let mut references = BTreeMap::new();
+
+        let error = decode_tile_block(
+            7,
+            &mut surface,
+            &mut references,
+            &upgrade,
+            &[coarser],
+            &[],
+            false,
+        )
+        .err()
+        .expect("invalid quantization must reject the upgrade");
+        assert!(matches!(
+            error,
+            ProgressiveDecodeError::InvalidUpgradeQuantization {
+                component: 0,
+                band: 0,
+                ..
+            }
+        ));
+        let retained = surface.get(0, 0).unwrap();
+        assert_eq!(retained.pass, 1);
+        assert_eq!(retained.coefficients[0][0], 42);
+        assert!(references.is_empty());
+    }
+
+    #[test]
+    fn upgrade_tracks_base_quant_from_last_successful_pass() {
+        let mut tile = TileState::new();
+        tile.pass = 1;
+        let mut newer_base = tile.base_quant;
+        newer_base[0].hl1 = newer_base[0].hl1.saturating_add(1);
+        tile.decode_upgrade_with_base(
+            [&[], &[], &[]],
+            [&[], &[], &[]],
+            [ComponentCodecQuant::LOSSLESS; 3],
+            newer_base,
+            false,
+            0xFF,
+        )
+        .unwrap();
+        assert_eq!(tile.last_upgrade_base_quant[0].hl1, newer_base[0].hl1);
+        assert_eq!(tile.base_quant[0].hl1, 6);
+    }
+
+    #[test]
+    fn upgrade_compares_total_bit_position_when_base_quant_changes() {
+        let mut previous_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut previous_prog = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut next_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let next_prog = [ComponentCodecQuant::LOSSLESS; 3];
+
+        previous_base[0].hl1 = 6;
+        previous_prog[0].hl1 = 2;
+        next_base[0].hl1 = 7;
+        // Effective BitPos goes from 8 to 7, so the upgrade is valid even
+        // though the base quantization value increases.
+        assert!(validate_upgrade_quantization(
+            &previous_base, &previous_prog, &next_base, &next_prog
+        ).is_ok());
+
+        next_base[0].hl1 = 9;
+        assert!(matches!(
+            validate_upgrade_quantization(
+                &previous_base, &previous_prog, &next_base, &next_prog
+            ),
+            Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                previous: 8,
+                next: 9,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2224,6 +2517,26 @@ mod tests {
                 .is_ok(),
             "a new codec context should use the retained surface reference"
         );
+    }
+
+    #[test]
+    fn decoder_drops_tile_reference_when_surface_resizes_within_same_tile_grid() {
+        let mut decoder = ProgressiveDecoder::new();
+        let initial = simple_tile_stream(0, [42, -6, 5], true);
+        decoder.decode_bitmap(9, 1, 65, 65, &initial).unwrap();
+
+        assert_eq!(decoder.contexts[&(9, 1)].surface.tiles_wide, 2);
+        assert_eq!(decoder.contexts[&(9, 1)].surface.width_pixels, 65);
+        assert!(decoder.contexts[&(9, 1)].surface.get(0, 0).is_some());
+        assert!(decoder.references.contains_key(&(9, 0, 0)));
+
+        // 65 -> 127 pixels changes the surface but remains two 64px tiles.
+        // No new tiles are sent, so no old history may be retained.
+        decoder.decode_bitmap(9, 1, 127, 127, &minimal_progressive_stream(false)).unwrap();
+        assert_eq!(decoder.contexts[&(9, 1)].surface.tiles_wide, 2);
+        assert_eq!(decoder.contexts[&(9, 1)].surface.width_pixels, 127);
+        assert!(decoder.contexts[&(9, 1)].surface.get(0, 0).is_none());
+        assert!(!decoder.references.contains_key(&(9, 0, 0)));
     }
 
     #[test]
