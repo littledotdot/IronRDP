@@ -2234,6 +2234,57 @@ mod tests {
     }
 
     #[test]
+    fn invalid_upgrade_does_not_corrupt_prior_tile_or_reference() {
+        use ironrdp_pdu::codecs::rfx::progressive::{ProgressiveTile, TileUpgrade};
+
+        let mut surface = SurfaceTiles::new(64, 64, false).unwrap();
+        let tile_state = surface.get_or_create(0, 0).unwrap();
+        tile_state.pass = 1;
+        tile_state.coefficients[0][0] = 42;
+        let mut coarser = tile_state.base_quant[0];
+        coarser.hl1 += 1;
+
+        let upgrade = ProgressiveTile::Upgrade(TileUpgrade {
+            quant_idx_y: 0,
+            quant_idx_cb: 0,
+            quant_idx_cr: 0,
+            x_idx: 0,
+            y_idx: 0,
+            quality: 0xFF,
+            y_srl_data: &[],
+            y_raw_data: &[],
+            cb_srl_data: &[],
+            cb_raw_data: &[],
+            cr_srl_data: &[],
+            cr_raw_data: &[],
+        });
+        let mut references = BTreeMap::new();
+
+        let error = decode_tile_block(
+            7,
+            &mut surface,
+            &mut references,
+            &upgrade,
+            &[coarser],
+            &[],
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgressiveDecodeError::InvalidUpgradeQuantization {
+                component: 0,
+                band: 0,
+                ..
+            }
+        ));
+        let retained = surface.get(0, 0).unwrap();
+        assert_eq!(retained.pass, 1);
+        assert_eq!(retained.coefficients[0][0], 42);
+        assert!(references.is_empty());
+    }
+
+    #[test]
     fn upgrade_compares_total_bit_position_when_base_quant_changes() {
         let mut previous_base = [ComponentCodecQuant::LOSSLESS; 3];
         let mut previous_prog = [ComponentCodecQuant::LOSSLESS; 3];
