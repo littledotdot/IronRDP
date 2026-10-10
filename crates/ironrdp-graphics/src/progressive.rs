@@ -969,8 +969,29 @@ impl TileState {
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
-    ) -> Result<(), SrlError> {
+    ) -> Result<(), ProgressiveDecodeError> {
         let prev_prog_quant = self.prog_quant;
+
+        // FreeRDP's progressive_rfx_quant_sub rejects a quality regression.
+        // Saturating a negative delta to zero would silently accept an
+        // invalid upgrade and replace the reference quantization, making
+        // later (otherwise valid) refinements decode against the wrong state.
+        // Validate all components and bands before touching tile state.
+        for (component, (previous, next)) in prev_prog_quant.iter().zip(prog_quants.iter()).enumerate() {
+            for band in 0..NUM_BANDS {
+                let previous_bit_pos = previous.for_band(band);
+                let next_bit_pos = next.for_band(band);
+                if next_bit_pos > previous_bit_pos {
+                    return Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                        component,
+                        band,
+                        previous: previous_bit_pos,
+                        next: next_bit_pos,
+                    });
+                }
+            }
+        }
+
         let mut coefficients = self.coefficients;
         let mut sign = self.sign;
 
@@ -1185,6 +1206,13 @@ pub enum ProgressiveDecodeError {
     TileOutOfBounds { x_idx: u16, y_idx: u16 },
     /// Region references a quant index beyond the table.
     InvalidQuantIndex { index: usize, table_len: usize },
+    /// Progressive refinement may only reveal more bits, never discard known bits.
+    InvalidUpgradeQuantization {
+        component: usize,
+        band: usize,
+        previous: u8,
+        next: u8,
+    },
     /// A difference tile has no previously decoded state to use as its reference.
     MissingTileReference { x_idx: u16, y_idx: u16 },
     /// Surface dimensions exceed [`MAX_SURFACE_DIM`] per axis.
@@ -1203,6 +1231,12 @@ impl core::fmt::Display for ProgressiveDecodeError {
             }
             Self::InvalidQuantIndex { index, table_len } => {
                 write!(f, "quant index {index} exceeds table length {table_len}")
+            }
+            Self::InvalidUpgradeQuantization { component, band, previous, next } => {
+                write!(
+                    f,
+                    "progressive upgrade component {component} band {band} regresses from bit position {previous} to {next}"
+                )
             }
             Self::MissingTileReference { x_idx, y_idx } => {
                 write!(f, "difference tile ({x_idx}, {y_idx}) has no retained reference")
@@ -2136,6 +2170,42 @@ mod tests {
         assert!(!tile.use_reduce_extrapolate);
         assert!(tile.coefficients[0].iter().all(|&v| v == 0));
         assert!(tile.sign[0].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn upgrade_rejects_quality_regression_before_modifying_tile() {
+        let mut tile = TileState::new();
+        tile.pass = 1;
+        tile.coefficients[0][0] = 137;
+        tile.sign[0][0] = SIGN_POSITIVE;
+
+        // A larger BitPos means coarser quality. FreeRDP rejects it rather
+        // than consuming the stream as a zero-bit upgrade.
+        let mut coarser = ComponentCodecQuant::LOSSLESS;
+        coarser.hl1 = 1;
+        let error = tile
+            .decode_upgrade(
+                [&[], &[], &[]],
+                [&[], &[], &[]],
+                [coarser, ComponentCodecQuant::LOSSLESS, ComponentCodecQuant::LOSSLESS],
+                1,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ProgressiveDecodeError::InvalidUpgradeQuantization {
+                component: 0,
+                band: 0,
+                previous: 0,
+                next: 1
+            }
+        ));
+        assert_eq!(tile.pass, 1);
+        assert_eq!(tile.quality, 0);
+        assert_eq!(tile.coefficients[0][0], 137);
+        assert_eq!(tile.sign[0][0], SIGN_POSITIVE);
+        assert_eq!(tile.prog_quant[0].hl1, 0);
     }
 
     #[test]
