@@ -1087,6 +1087,9 @@ impl Default for TileState {
 /// Tiles are lazily allocated on first access to avoid upfront memory
 /// cost for surfaces that only partially receive progressive updates.
 pub struct SurfaceTiles {
+    /// Original dimensions matter even when a resize stays in the same tile grid.
+    pub width_pixels: u16,
+    pub height_pixels: u16,
     /// Width of the surface in tiles (ceildiv of pixel width by 64).
     pub tiles_wide: u16,
     /// Height of the surface in tiles.
@@ -1122,6 +1125,8 @@ impl SurfaceTiles {
         let count = usize::from(tiles_wide) * usize::from(tiles_high);
 
         Ok(Self {
+            width_pixels,
+            height_pixels,
             tiles_wide,
             tiles_high,
             use_reduce_extrapolate,
@@ -1442,13 +1447,14 @@ impl ProgressiveDecoder {
             }
         };
 
-        // If surface dimensions changed, reallocate the codec-context tile grid.
-        let expected_wide = surface_width.div_ceil(TILE_DIM);
-        let expected_high = surface_height.div_ceil(TILE_DIM);
+        // A resize by less than one 64x64 tile still replaces the graphics
+        // surface, so the codec state must not survive merely because its
+        // tile-grid dimensions are unchanged.
         let surface_resized =
-            context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high;
+            context.surface.width_pixels != surface_width || context.surface.height_pixels != surface_height;
         if surface_resized {
             context.surface = SurfaceTiles::new(surface_width, surface_height, false)?;
+            references.retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         }
         let frame_tiles = all_frame_tiles.entry((surface_id, codec_context_id)).or_default();
         if surface_resized {
@@ -2511,6 +2517,26 @@ mod tests {
                 .is_ok(),
             "a new codec context should use the retained surface reference"
         );
+    }
+
+    #[test]
+    fn decoder_drops_tile_reference_when_surface_resizes_within_same_tile_grid() {
+        let mut decoder = ProgressiveDecoder::new();
+        let initial = simple_tile_stream(0, [42, -6, 5], true);
+        decoder.decode_bitmap(9, 1, 65, 65, &initial).unwrap();
+
+        assert_eq!(decoder.contexts[&(9, 1)].surface.tiles_wide, 2);
+        assert_eq!(decoder.contexts[&(9, 1)].surface.width_pixels, 65);
+        assert!(decoder.contexts[&(9, 1)].surface.get(0, 0).is_some());
+        assert!(decoder.references.contains_key(&(9, 0, 0)));
+
+        // 65 -> 127 pixels changes the surface but remains two 64px tiles.
+        // No new tiles are sent, so no old history may be retained.
+        decoder.decode_bitmap(9, 1, 127, 127, &minimal_progressive_stream(false)).unwrap();
+        assert_eq!(decoder.contexts[&(9, 1)].surface.tiles_wide, 2);
+        assert_eq!(decoder.contexts[&(9, 1)].surface.width_pixels, 127);
+        assert!(decoder.contexts[&(9, 1)].surface.get(0, 0).is_none());
+        assert!(!decoder.references.contains_key(&(9, 0, 0)));
     }
 
     #[test]
