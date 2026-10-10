@@ -1916,6 +1916,79 @@ mod tests {
     }
 
     #[test]
+    fn progressive_dwt_mode_comes_from_region_not_context_flags() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, encode_progressive_stream,
+        };
+
+        // CONTEXT bit 0 is SUBBAND_DIFFING; REGION bit 0 selects the
+        // reduce-extrapolate DWT. FreeRDP deliberately reads them separately.
+        for (context_flags, region_flags, expected_mode) in [(1, 0, false), (0, 1, true)] {
+            let base = TileState::new().base_quant[0];
+            let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut encoded = [0u8; 32768];
+            let encoded_len = encode_first_pass(
+                &mut coefficients,
+                &mut encoded,
+                &base,
+                &ComponentCodecQuant::LOSSLESS,
+                expected_mode,
+            )
+            .unwrap();
+            let data = &encoded[..encoded_len];
+
+            let blocks = [
+                ProgressiveBlock::Sync(ProgressiveSyncPdu),
+                ProgressiveBlock::Context(ProgressiveContextPdu {
+                    context_id: 0,
+                    tile_size: 64,
+                    flags: context_flags,
+                }),
+                ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                    frame_index: 0,
+                    region_count: 1,
+                }),
+                ProgressiveBlock::Region(ProgressiveRegion {
+                    tile_size: 64,
+                    rects: vec![RfxRectangle {
+                        x: 0,
+                        y: 0,
+                        width: 64,
+                        height: 64,
+                    }],
+                    quant_vals: vec![base],
+                    quant_prog_vals: vec![],
+                    flags: region_flags,
+                    tiles: vec![ProgressiveTile::Simple(TileSimple {
+                        quant_idx_y: 0,
+                        quant_idx_cb: 0,
+                        quant_idx_cr: 0,
+                        x_idx: 0,
+                        y_idx: 0,
+                        flags: 0,
+                        y_data: data,
+                        cb_data: data,
+                        cr_data: data,
+                        tail_data: &[],
+                    })],
+                }),
+                ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+            ];
+            let bitmap = encode_progressive_stream(&blocks).unwrap();
+            let mut decoder = ProgressiveDecoder::new();
+            let decoded = decoder.decode_bitmap(0, 10, 64, 64, &bitmap).unwrap();
+            assert_eq!(decoded.len(), 1);
+            let tile = decoder.contexts.get(&(0, 10)).unwrap().surface.get(0, 0).unwrap();
+            assert_eq!(
+                tile.use_reduce_extrapolate, expected_mode,
+                "context flags {context_flags:#x}, region flags {region_flags:#x}"
+            );
+        }
+    }
+
+    #[test]
     fn surface_tiles_rejects_over_cap_dimensions() {
         // At-cap accepted on both axes
         assert!(SurfaceTiles::new(MAX_SURFACE_DIM, MAX_SURFACE_DIM, false).is_ok());
