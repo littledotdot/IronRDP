@@ -1359,7 +1359,9 @@ pub struct ProgressiveDecoder {
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
     frame_tiles: BTreeMap<(u16, u32), BTreeSet<(u16, u16)>>,
     frame_active: bool,
-    surface_context_flags: BTreeMap<u16, bool>,
+    // Windows may omit CONTEXT when opening another codec context on the
+    // same surface. Presence, not CONTEXT flags, is what may be reused.
+    surfaces_with_context: BTreeSet<u16>,
 }
 
 impl ProgressiveDecoder {
@@ -1370,7 +1372,7 @@ impl ProgressiveDecoder {
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
-            surface_context_flags: BTreeMap::new(),
+            surfaces_with_context: BTreeSet::new(),
         }
     }
 
@@ -1409,37 +1411,19 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract the band-layout flag from the CONTEXT block when present.
-        // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
-        // context once (keyed by `(surface_id, codec_context_id)`) and are not
-        // required to be
-        // repeated on subsequent frames that reference the same context.
-        // Real-world servers (xrdp, GNOME Remote Desktop) omit the CONTEXT
-        // block on every frame after the first one that established the
-        // context. The strict requirement rejected each of those frames with
-        // `MissingBlock("CONTEXT")`, freezing the image on the coarse first
-        // pass.
-        //
-        // Fall back to the value stored when the context was first created, then to the last
-        // one this surface described: Windows opens a new codec context id mid-session,
-        // deletes the previous one, and never repeats SYNC + CONTEXT, so a per-context lookup
-        // alone rejects the new context. The retained value is scoped to its surface and
-        // released with it. Only error when no source is available at all.
-        let signalled = blocks.iter().find_map(|block| match block {
-            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-            _ => None,
-        });
-        if let Some(flag) = signalled {
-            self.surface_context_flags.insert(surface_id, flag);
+        // CONTEXT flags describe codec capabilities such as SUBBAND_DIFFING;
+        // the per-REGION flags select the reduce-extrapolate DWT layout.
+        // Remember that a context was established without reusing its flags as
+        // the REGION mode. Windows and other servers may omit repeated CONTEXT
+        // blocks, including when allocating another codec context on a surface.
+        if blocks.iter().any(|block| matches!(block, ProgressiveBlock::Context(_))) {
+            self.surfaces_with_context.insert(surface_id);
         }
-        let use_reduce_extrapolate = signalled
-            .or_else(|| {
-                self.contexts
-                    .get(&(surface_id, codec_context_id))
-                    .map(|c| c.surface.use_reduce_extrapolate)
-            })
-            .or_else(|| self.surface_context_flags.get(&surface_id).copied())
-            .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
+        if !self.contexts.contains_key(&(surface_id, codec_context_id))
+            && !self.surfaces_with_context.contains(&surface_id)
+        {
+            return Err(ProgressiveDecodeError::MissingBlock("CONTEXT"));
+        }
 
         // Direct users of the decoder get one self-contained frame per call.
         // The EGFX client brackets multiple payloads with begin_frame/end_frame.
@@ -1453,7 +1437,7 @@ impl ProgressiveDecoder {
         let context = match contexts.entry((surface_id, codec_context_id)) {
             Entry::Occupied(e) => e.into_mut(),
             Entry::Vacant(e) => {
-                let surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+                let surface = SurfaceTiles::new(surface_width, surface_height, false)?;
                 e.insert(ProgressiveContext { surface })
             }
         };
@@ -1464,10 +1448,8 @@ impl ProgressiveDecoder {
         let surface_resized =
             context.surface.tiles_wide != expected_wide || context.surface.tiles_high != expected_high;
         if surface_resized {
-            context.surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+            context.surface = SurfaceTiles::new(surface_width, surface_height, false)?;
         }
-        context.surface.use_reduce_extrapolate = use_reduce_extrapolate;
-
         let frame_tiles = all_frame_tiles.entry((surface_id, codec_context_id)).or_default();
         if surface_resized {
             frame_tiles.clear();
@@ -1621,7 +1603,7 @@ impl ProgressiveDecoder {
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         self.frame_tiles
             .retain(|(context_surface_id, _), _| *context_surface_id != surface_id);
-        self.surface_context_flags.remove(&surface_id);
+        self.surfaces_with_context.remove(&surface_id);
     }
 
     /// Reset codec-context state while retaining surface sub-band references.
