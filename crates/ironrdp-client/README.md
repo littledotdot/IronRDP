@@ -15,6 +15,11 @@ After Soft-Sync migrates a channel, sideband loss ends the connection so automat
 Gateway, RDCleanPath, named-pipe, Hyper-V VM Connect, and standard RDP security transports are TCP-only; `prefer_direct` may use UDP only for its direct attempt.
 Legacy RDP-UDP v1/v2 data transfer and lossy RDP-UDP-L are not supported.
 
+The Wendao comparison build disables RDPGFX/Progressive: the connector does not advertise
+the graphics capability or register its dynamic channel. Legacy graphics remain available,
+as do DisplayControl, RDPEI, and the other dynamic channels. This isolates stale-region
+rendering reports; it does not establish a Progressive decoder fix.
+
 The library is winit-agnostic. Output events are emitted on a bounded
 `tokio::sync::mpsc::Sender<RdpOutputEvent>` channel: the embedder is responsible
 for consuming them and dispatching them to whatever event loop or runtime it wishes.

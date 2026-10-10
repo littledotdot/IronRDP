@@ -80,7 +80,6 @@ ironrdp-session = { path = "../ironrdp-session", version = "0.11" } # public
 ironrdp-graphics = { path = "../ironrdp-graphics", version = "0.9" } # public
 ironrdp-displaycontrol = { path = "../ironrdp-displaycontrol", version = "0.8" }
 ironrdp-echo = { path = "../ironrdp-echo", version = "0.4" }
-ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.3" }
 ironrdp-rdpei = { path = "../ironrdp-rdpei", version = "0.1" }
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1", optional = true }
 ironrdp-rdpeudp-tokio = { path = "../ironrdp-rdpeudp-tokio", version = "0.1", optional = true }
@@ -123,6 +122,9 @@ x509-cert = { version = "0.3", default-features = false, features = ["std"] }
 ironrdp-dvc-com-plugin = { path = "../ironrdp-dvc-com-plugin", version = "0.1", optional = true }
 ironrdp-rdpewa = { path = "../ironrdp-rdpewa", version = "0.1", optional = true }
 ironrdp-rdpewa-native = { path = "../ironrdp-rdpewa-native", version = "0.1", optional = true }
+
+[dev-dependencies]
+ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.3" }
 
 [lints]
 workspace = true

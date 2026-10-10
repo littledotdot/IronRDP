@@ -24,7 +24,6 @@ use ironrdp_dvc::pdu::SoftSyncTunnelType;
 #[cfg(any(all(windows, feature = "dvc-com-plugin"), feature = "sound"))]
 use ironrdp_dvc::{DvcChannelListener, DvcClientProcessor, DynamicChannelId};
 use ironrdp_echo::client::EchoClient;
-use ironrdp_egfx::client::{GraphicsPipelineClient, GraphicsPipelineHandler};
 use ironrdp_graphics::image_processing::PixelFormat;
 use ironrdp_graphics::pointer::DecodedPointer;
 use ironrdp_pdu::gcc::{ChannelName, Monitor};
@@ -1578,18 +1577,10 @@ fn build_connector(
     #[cfg(not(all(windows, feature = "vmconnect")))]
     let _ = output_event_sender;
 
-    // The client-side compositor (ironrdp-egfx) holds the surface pixel state and
-    // the session drains it into the framebuffer, so the graphics pipeline's
-    // per-command notification callbacks are unused here. Without an H.264 decoder
-    // the client advertises only the non-AVC capability sets it can actually decode.
-    struct EgfxHandler;
-    impl GraphicsPipelineHandler for EgfxHandler {}
-
     let mut drdynvc = ironrdp_dvc::DrdynvcClient::new()
         .with_dynamic_channel(DisplayControlClient::new(|_| Ok(Vec::new())))
         .with_dynamic_channel(EchoClient::new())
-        .with_dynamic_channel(RdpeiClient::default())
-        .with_dynamic_channel(GraphicsPipelineClient::new(Box::new(EgfxHandler), None));
+        .with_dynamic_channel(RdpeiClient::default());
 
     #[cfg(feature = "location")]
     if config.channels.location {
@@ -5194,6 +5185,33 @@ mod tests {
             expected_name.len()
         );
         assert_eq!(&wire[28..], expected_name);
+    }
+
+    #[cfg(feature = "rdpdr")]
+    #[test]
+    fn legacy_graphics_does_not_register_the_progressive_channel() {
+        let config = test_config();
+        assert!(!config.connector().support_dyn_vc_gfx_protocol);
+        let (input_sender, _) = RdpInputSender::channel(1);
+        let (output_event_sender, _) = crate::output_channel::output_channel(1);
+        let mut connector = build_connector(
+            &config,
+            SocketAddr::from(([127, 0, 0, 1], 0)),
+            (&input_sender, &output_event_sender),
+            no_cliprdr_factory(),
+            None,
+            true,
+            false,
+            None,
+        )
+        .expect("legacy graphics connector should build");
+        let channels = connector
+            .get_static_channel_processor::<ironrdp_dvc::DrdynvcClient>()
+            .expect("other dynamic channels remain available");
+        assert!(!channels.has_registered_dvc::<ironrdp_egfx::client::GraphicsPipelineClient>());
+        assert!(channels.has_registered_dvc::<DisplayControlClient>());
+        assert!(channels.has_registered_dvc::<EchoClient>());
+        assert!(channels.has_registered_dvc::<RdpeiClient>());
     }
 
     #[cfg(feature = "rdpdr")]

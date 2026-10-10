@@ -1947,8 +1947,8 @@ impl ConfigBuilder {
             request_data: None,
             pointer_software_rendering: self.pointer_software_rendering.unwrap_or(false),
             multitransport_flags: None,
-            // Progressive graphics are composited through the dynamic graphics channel.
-            support_dyn_vc_gfx_protocol: true,
+            // Use legacy graphics while investigating stale Progressive regions.
+            support_dyn_vc_gfx_protocol: false,
             compression_type,
             performance_flags: self.performance_flags.unwrap_or_default(),
             timezone_info: TimezoneInfo::default(),
