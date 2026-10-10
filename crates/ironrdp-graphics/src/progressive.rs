@@ -981,6 +981,7 @@ impl TileState {
             raw_data,
             prog_quants,
             self.last_upgrade_base_quant,
+            self.use_reduce_extrapolate,
             quality,
         )
     }
@@ -991,6 +992,7 @@ impl TileState {
         raw_data: [&[u8]; 3],
         prog_quants: [ComponentCodecQuant; 3],
         next_base_quant: [ComponentCodecQuant; 3],
+        use_reduce_extrapolate: bool,
         quality: u8,
     ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
@@ -1004,7 +1006,7 @@ impl TileState {
                 raw_data[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
-                self.use_reduce_extrapolate,
+                use_reduce_extrapolate,
                 &mut coefficients[c],
                 &mut sign[c],
             )?;
@@ -1014,6 +1016,7 @@ impl TileState {
         self.sign = sign;
         self.prog_quant = prog_quants;
         self.last_upgrade_base_quant = next_base_quant;
+        self.use_reduce_extrapolate = use_reduce_extrapolate;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
 
@@ -1493,6 +1496,13 @@ impl ProgressiveDecoder {
                 _ => continue,
             };
 
+            // MS-RDPRFX region flags select the DWT layout. The CONTEXT flag
+            // is SUBBAND_DIFFING, not DWT_REDUCE_EXTRAPOLATE (FreeRDP's
+            // progressive_decompress_tile_first/upgrade uses region->flags).
+            // These flags happen to share bit 0 but have distinct meanings.
+            let region_use_reduce_extrapolate = region.uses_reduce_extrapolate();
+            context.surface.use_reduce_extrapolate = region_use_reduce_extrapolate;
+
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
                 let tiles = decode_tile_block(
@@ -1502,7 +1512,7 @@ impl ProgressiveDecoder {
                     tile_block,
                     &region.quant_vals,
                     &region.quant_prog_vals,
-                    use_reduce_extrapolate,
+                    region_use_reduce_extrapolate,
                 )?;
                 for tile in tiles {
                     let key = (tile.x_idx, tile.y_idx);
@@ -1832,6 +1842,7 @@ fn decode_tile_block(
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
                 next_base,
+                use_reduce_extrapolate,
                 tile.quality,
             )?;
             references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
@@ -2322,6 +2333,7 @@ mod tests {
             [&[], &[], &[]],
             [ComponentCodecQuant::LOSSLESS; 3],
             newer_base,
+            false,
             0xFF,
         )
         .unwrap();
