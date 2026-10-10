@@ -394,7 +394,11 @@ pub struct ProgressiveContextPdu {
     pub flags: u8,
 }
 
-/// Bit 0 of context flags: use reduce-extrapolate DWT.
+/// Bit 0 of CONTEXT flags controls subband diffing.
+pub const FLAG_SUBBAND_DIFFING: u8 = 0x01;
+
+/// Bit 0 of REGION flags selects reduce-extrapolate DWT.
+/// The two PDU fields have different meanings despite sharing the bit value.
 pub const FLAG_DWT_REDUCE_EXTRAPOLATE: u8 = 0x01;
 
 /// RFX_TILE_DIFFERENCE in TILE_SIMPLE and TILE_FIRST flags.
@@ -407,9 +411,17 @@ impl ProgressiveContextPdu {
     const NAME: &'static str = "ProgressiveContext";
     const FIXED_PART_SIZE: usize = 1 /* ctxId */ + 2 /* tileSize */ + 1 /* flags */;
 
-    /// Whether the reduce-extrapolate DWT variant is selected.
+    /// Whether CONTEXT enables subband difference coding. DWT mode is
+    /// controlled by REGION.flags, not this flag.
+    pub fn uses_subband_diffing(&self) -> bool {
+        self.flags & FLAG_SUBBAND_DIFFING != 0
+    }
+
+    /// Legacy accessor kept for source compatibility. Despite its name,
+    /// CONTEXT bit 0 is SUBBAND_DIFFING, not REGION DWT mode. New code must
+    /// use uses_subband_diffing() and ProgressiveRegion::uses_reduce_extrapolate().
     pub fn uses_reduce_extrapolate(&self) -> bool {
-        self.flags & FLAG_DWT_REDUCE_EXTRAPOLATE != 0
+        self.uses_subband_diffing()
     }
 }
 
@@ -1151,9 +1163,9 @@ mod tests {
         let original = ProgressiveContextPdu {
             context_id: 0,
             tile_size: 0x0040,
-            flags: FLAG_DWT_REDUCE_EXTRAPOLATE,
+            flags: FLAG_SUBBAND_DIFFING,
         };
-        assert!(original.uses_reduce_extrapolate());
+        assert!(original.uses_subband_diffing());
 
         let mut buf = [0u8; ProgressiveContextPdu::FIXED_PART_SIZE];
         original.encode(&mut WriteCursor::new(&mut buf)).unwrap();
