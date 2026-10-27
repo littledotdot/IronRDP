@@ -462,6 +462,8 @@ pub enum Request {
     },
     /// Capture the most recent frame (cursor composited in) as a PNG.
     Screenshot,
+    /// Follow decoded framebuffer updates as BGR24 frames on one long-lived IPC connection.
+    FrameStream,
     /// Move the mouse pointer to an absolute position.
     MouseMove { x: u16, y: u16 },
     /// Press or release a mouse button.
@@ -596,6 +598,7 @@ impl fmt::Debug for Request {
                 .field("last", last)
                 .finish(),
             Self::Screenshot => f.write_str("Screenshot"),
+            Self::FrameStream => f.write_str("FrameStream"),
             Self::MouseMove { x, y } => f.debug_struct("MouseMove").field("x", x).field("y", y).finish(),
             Self::MouseButton { button, pressed } => f
                 .debug_struct("MouseButton")
@@ -769,6 +772,13 @@ pub enum Payload {
     Logs(Vec<String>),
     /// The most recent frame encoded as a PNG (cursor included), with its dimensions.
     Screenshot { width: u16, height: u16, png: Vec<u8> },
+    /// One decoded framebuffer update in tightly packed BGR24 row-major order.
+    Frame {
+        sequence: u64,
+        width: u16,
+        height: u16,
+        bgr: Vec<u8>,
+    },
     /// Negotiated NOW capabilities.
     NowCapabilities(NowCapabilities),
     /// One durable NOW operation.
@@ -811,6 +821,18 @@ impl fmt::Debug for Payload {
                 .field("width", width)
                 .field("height", height)
                 .field("png_len", &png.len())
+                .finish(),
+            Self::Frame {
+                sequence,
+                width,
+                height,
+                bgr,
+            } => f
+                .debug_struct("Frame")
+                .field("sequence", sequence)
+                .field("width", width)
+                .field("height", height)
+                .field("bgr_len", &bgr.len())
                 .finish(),
             Self::NowCapabilities(capabilities) => f.debug_tuple("NowCapabilities").field(capabilities).finish(),
             Self::NowOperation(operation) => f.debug_tuple("NowOperation").field(operation).finish(),
@@ -2203,6 +2225,18 @@ impl Encode for Payload {
                 dst.write_u8(14);
                 write_opt_bytes(dst, png.as_deref())?;
             }
+            Self::Frame {
+                sequence,
+                width,
+                height,
+                bgr,
+            } => {
+                dst.write_u8(18);
+                dst.write_u64(*sequence);
+                dst.write_u16(*width);
+                dst.write_u16(*height);
+                write_bytes(dst, bgr)?;
+            }
             Self::ClipboardHtml(html) => {
                 dst.write_u8(15);
                 write_opt_string(dst, html.as_deref())?;
@@ -2248,6 +2282,7 @@ impl Encode for Payload {
                 Self::RailLaunch(launch) => launch.size(),
                 Self::ClipboardText(text) => opt_string_size(text.as_deref()),
                 Self::ClipboardImage(png) => opt_bytes_size(png.as_deref()),
+                Self::Frame { bgr, .. } => 8 /* sequence */ + 2 /* width */ + 2 /* height */ + bytes_size(bgr),
                 Self::ClipboardHtml(html) => opt_string_size(html.as_deref()),
                 Self::ClipboardFileList(files) => {
                     1 /* presence */
@@ -2339,6 +2374,26 @@ impl Decode<'_> for Payload {
                     return Err(ironrdp_core::invalid_field_err!("clipboard file", "too large"));
                 }
                 Ok(Self::ClipboardFile(data))
+            }
+            18 => {
+                ensure_size!(in: src, size: 12);
+                let sequence = src.read_u64();
+                let width = src.read_u16();
+                let height = src.read_u16();
+                let bgr = read_bytes(src)?;
+                let expected = usize::from(width)
+                    .checked_mul(usize::from(height))
+                    .and_then(|pixels| pixels.checked_mul(3))
+                    .ok_or_else(|| ironrdp_core::invalid_field_err!("frame", "dimensions overflow"))?;
+                if bgr.len() != expected {
+                    return Err(ironrdp_core::invalid_field_err!("frame", "unexpected BGR byte length", in: src));
+                }
+                Ok(Self::Frame {
+                    sequence,
+                    width,
+                    height,
+                    bgr,
+                })
             }
             _ => Err(ironrdp_core::invalid_field_err!("payload", "unknown tag", in: src)),
         }
@@ -2592,6 +2647,7 @@ impl Encode for Request {
                 dst.write_u8(32);
                 write_bytes(dst, png)?;
             }
+            Self::FrameStream => dst.write_u8(41),
             Self::ClipboardGetHtml => dst.write_u8(33),
             Self::ClipboardSetHtml { html } => {
                 dst.write_u8(34);
@@ -2634,7 +2690,8 @@ impl Encode for Request {
                 | Self::RailStatus
                 | Self::ClipboardGet
                 | Self::ClipboardGetImage
-                | Self::ClipboardGetHtml => 0,
+                | Self::ClipboardGetHtml
+                | Self::FrameStream => 0,
                 Self::DisconnectMatching { server } => string_size(server),
                 Self::QueryProps { filter } => 1 /* presence */ + filter.as_ref().map_or(0, Encode::size),
                 Self::QueryLogs { substring, last } => {
@@ -2922,6 +2979,7 @@ impl Decode<'_> for Request {
                 }
                 Ok(Self::ClipboardSetImage { png })
             }
+            41 => Ok(Self::FrameStream),
             33 => Ok(Self::ClipboardGetHtml),
             34 => {
                 let html = read_string(src)?;
@@ -3328,6 +3386,27 @@ mod tests {
         KeyInput, MAX_KEY_BATCH_EVENTS, MAX_RAIL_EVENT_DUMP_EVENTS, RailEvent, RailEventDump, RailEventKind,
         RailExecuteRequest, Request,
     };
+
+    #[test]
+    fn frame_stream_request_and_payload_round_trip() {
+        let request = Request::FrameStream;
+        let encoded = encode_vec(&request).expect("encode frame stream request");
+        assert_eq!(encoded, [41]);
+        assert_eq!(
+            decode::<Request>(&encoded).expect("decode frame stream request"),
+            request
+        );
+
+        let response = Response::Ok(Payload::Frame {
+            sequence: 7,
+            width: 2,
+            height: 1,
+            bgr: vec![1, 2, 3, 4, 5, 6],
+        });
+        let encoded = encode_vec(&response).expect("encode frame response");
+        assert_eq!(&encoded[..2], &[0, 18]);
+        assert_eq!(decode::<Response>(&encoded).expect("decode frame response"), response);
+    }
 
     #[test]
     fn daemon_stop_has_a_distinct_request_tag() {
