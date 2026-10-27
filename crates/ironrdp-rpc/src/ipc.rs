@@ -3405,7 +3405,17 @@ mod tests {
         });
         let encoded = encode_vec(&response).expect("encode frame response");
         assert_eq!(&encoded[..2], &[0, 18]);
+        // Wendao's Python client reads this wire layout verbatim.
+        assert_eq!(&encoded[2..10], &7u64.to_le_bytes());
+        assert_eq!(&encoded[10..12], &2u16.to_le_bytes());
+        assert_eq!(&encoded[12..14], &1u16.to_le_bytes());
+        assert_eq!(&encoded[14..18], &6u32.to_le_bytes());
+        assert_eq!(&encoded[18..], &[1, 2, 3, 4, 5, 6]);
         assert_eq!(decode::<Response>(&encoded).expect("decode frame response"), response);
+
+        let mut malformed = encoded;
+        malformed[14..18].copy_from_slice(&5u32.to_le_bytes());
+        assert!(decode::<Response>(&malformed).is_err());
     }
 
     #[test]
