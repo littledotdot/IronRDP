@@ -2571,6 +2571,8 @@ fn print_payload(payload: Payload) {
         }
         // Screenshots are handled out-of-band by `write_screenshot`, never printed.
         Payload::Screenshot { width, height, .. } => println!("frame {width}x{height}"),
+        // FrameStream frames are consumed programmatically; never print their raw bytes.
+        Payload::Frame { sequence, width, height, .. } => println!("frame #{sequence} {width}x{height}"),
         Payload::NowCapabilities(capabilities) => {
             println!("NOW {}.{}", capabilities.version_major, capabilities.version_minor);
         }
