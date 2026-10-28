@@ -2169,7 +2169,13 @@ fn build_connector(
     // and is awaited when the graphics channel opens, so a slow start does not delay
     // connecting.
     struct EgfxHandler;
-    impl GraphicsPipelineHandler for EgfxHandler {}
+    impl GraphicsPipelineHandler for EgfxHandler {
+        fn on_capabilities_confirmed(&mut self, caps: &ironrdp_egfx::pdu::CapabilitySet) {
+            // This callback is reached only after the server confirms an EGFX
+            // capability set. A requested property alone is not proof of EGFX.
+            info!(version = caps.version().0, "Wendao EGFX capability negotiated");
+        }
+    }
 
     let h264_decoder = config
         .channels
@@ -4218,6 +4224,8 @@ async fn active_session(
     let mut graceful_shutdown_sent = false;
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
+    #[cfg(feature = "udp")]
+    let mut udp_dvc_was_active = false;
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
         Some(active_stage.graceful_shutdown()?)
@@ -4236,6 +4244,18 @@ async fn active_session(
     let mut rdpei_input_state = None;
 
     let disconnect_reason = 'outer: loop {
+        #[cfg(feature = "udp")]
+        {
+            let udp_active = active_stage.reliable_udp_dvc_tunnel_in_use();
+            if udp_active && !udp_dvc_was_active {
+                // Log actual post-Soft-Sync use, rather than just requested
+                // UDP or completed sideband handshake.
+                info!("Wendao reliable RDP-UDP DVC tunnel active");
+            } else if !udp_active && udp_dvc_was_active {
+                warn!("Wendao reliable RDP-UDP DVC tunnel no longer active");
+            }
+            udp_dvc_was_active = udp_active;
+        }
         let resize_deadline = resize_queue.deadline();
         let input_batch_deadline = input_batcher.deadline();
         #[cfg(feature = "video")]
