@@ -45,6 +45,12 @@ tokio = { version = "1", features = ["test-util"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Wendao macOS daemon needs a real AVC420 decoder before advertising
+# H.264 EGFX capabilities. Windows uses its Media Foundation decoder instead.
+# OpenH264 is a software baseline; measure CPU before choosing VideoToolbox.
+[target.'cfg(target_os = "macos")'.dependencies]
+ironrdp-client = { path = "../ironrdp-client", version = "0.1", features = ["openh264"] }
+
 [target.'cfg(windows)'.dependencies]
 # WebAuthn redirection is Windows-only (webauthn.dll / WebAuthN* APIs).
 ironrdp-client = { path = "../ironrdp-client", version = "0.1", features = ["camera", "webauthn"] }
