@@ -22,7 +22,6 @@ for consuming them and dispatching them to whatever event loop or runtime it wis
 The optional `entra-auth` feature provides an experimental implementation of the [MS-RDPBCGR] RDS AAD authorization-code and proof-of-possession flow.
 Call `EntraAuthorization::begin(client_id, redirect_uri, resource)` with an application client ID you are authorized to use and its registered redirect URI; there are no first-party registration defaults.
 The method returns a browser URL; the embedder must capture the `form_post` response at its redirect URI and pass the authorization code and state to `complete`.
-This module does not implement browser callback capture or Windows Web Account Manager (WAM).
 An app registration and redirect URI alone do not establish permission to obtain RDP resource tokens; third-party registration acceptance has not been verified.
 Attach the resulting `EntraAuthSession` with `ConfigBuilder::with_entra_auth` to authenticate the RDP session using RDS AAD over strictly validated TLS, without a CredSSP or password fallback.
 The high-level client supports direct and RDS Gateway transports for Entra authentication; it rejects RDCleanPath because that path does not validate the RDP server's TLS certificate.
@@ -30,6 +29,7 @@ Entra authentication also rejects certificate-validation override callbacks.
 Certificate validation uses platform trust and the server's DNS name; Entra P2P certificate validation using tenant roots and a device ID is not implemented.
 The embedder owns browser UI and must choose the target host name or device ID that matches the RDP server.
 This flow uses Microsoft's documented public-cloud authority and requires a new authorization flow after the access token expires.
+When combined with `gateway`, `gatewaybrokeringtype:i:1` enables Azure Virtual Desktop orchestration over WebSocket, acquiring gateway and session-host PoP tokens through Windows Web Account Manager on Windows, `OAuthAvdTokenProvider` (loopback PKCE, device code, and refresh-token cache) across platforms, or a custom `AvdTokenProvider` set with `ConfigBuilder::with_avd_token_provider`.
 Live Entra host interoperability has not been verified.
 
 TLS peer-certificate validation remains disabled by default for compatibility with
@@ -37,7 +37,16 @@ existing deployments. `ConfigBuilder` exposes an explicit
 `CertificateValidation::Strict` policy for callers that require platform-root and
 server-name validation.
 
-Entra HTTP requests use platform-root validation and the client's selected TLS backend.
+Cloud PC, AVD feed, and Entra HTTP requests use platform-root validation and the client's selected TLS backend.
+
+The experimental `remote-guard` feature forwards [Remote Credential Guard][rcg-build] through the Tokio and async drivers.
+Select `ConfigBuilder::with_remote_guard_mode` with `RemoteGuardMode::Negotiate`, `Ntlm`, or `Kerberos` from `ironrdp_client::config`, and explicitly select strict TLS validation.
+All modes require Kerberos for initial authentication; the mode mirrors CredSSP package selection, with `Negotiate` permitting both Kerberos and outbound NTLMv2 redirection and the other two restricting redirection to one package.
+The client retains the CredSSP context and registers MS-RDPEAR on its existing DRDYNVC carrier.
+Without an explicit Kerberos configuration, RCG enables DNS KDC discovery using the configured client computer name.
+The account realm must be DNS-resolvable; SAM/NetBIOS identities require an explicit KDC URL.
+Unsupported builds, invalid policies, insecure transports, RDCleanPath, VMConnect, and automatic reconnect fail rather than downgrading authentication.
+The feature is off by default and is not included in `all`.
 
 The optional `camera` feature enables MS-RDPECAM camera redirection, selected with `ConfigBuilder::with_cameras` or the `camerastoredirect` `.rdp` property.
 Capture uses Media Foundation and is only available on Windows; cameras attached or removed during the session are advertised or withdrawn as they come and go.
@@ -66,7 +75,37 @@ Through an RD Gateway, USB redirection follows the gateway's Plug and Play devic
 
 For the end-user RDP client binary, see [`ironrdp-viewer`](../ironrdp-viewer).
 
+## Cloud discovery and browser handoff
+
+The optional `cloud` feature exposes `cloud::CloudPcClient` for [Graph Cloud PC discovery], [Graph launch details], direct-launch URL builders for [Windows App], AVD RDWeb feed discovery, and PKCS#7 `.rdp` signature verification.
+The module does not implement broker allocation, reverse-connect/WebSocket service transport, device bootstrap, or session authentication.
+
+Acquire a delegated Microsoft Graph token with `CloudPC.Read.All` permission through your identity provider, then call `list_page(&token, None)` to discover Cloud PCs attributed to that user.
+For a Windows 365 Cloud PC, call `retrieve_launch_detail(&token, &cloud_pc.id)` and open its service-provided `launch_url()` in a supported browser.
+The API also reports whether the Cloud PC supports Windows 365 Switch.
+The returned URL is browser connection state, not an RDP target or reverse-connect endpoint.
+Alternatively, call `cloud_pc.launch_url(tenant_id)` to construct the documented direct-launch URL.
+Direct launch requires a provisioned Windows 365 Enterprise or Flex Dedicated Cloud PC.
+For AVD desktops and RemoteApps, call `avd_launch_url` with the workspace and resource **object IDs**, obtainable through Azure PowerShell as described in the Windows App documentation.
+The resource must be assigned to the user; supply the hosting tenant ID for external identities.
+
+For AVD RDWeb feeds, build the discovery URL with `AvdCloudEnvironment::feed_discovery_url`, call `discover_avd_feeds` and `fetch_avd_workspace_feed` with an RDWeb bearer token, and call `download_avd_rdp_file` or `verify_rdp_signature` to validate the detached PKCS#7 signature and `signscope` sensitive-setting coverage on signed `.rdp` files.
+Signature verification loads platform trust anchors through `rustls-native-certs` independently of the HTTP client's selected TLS backend, and skips platform root entries that cannot be decoded as X.509 DER certificates.
+
+Discovery and launch-detail retrieval use only the global Graph endpoint and return one page or launch result per call.
+Pass the previous page's `next_link` to request another page, with a fresh token if necessary; callers control cancellation and page limits.
+Requests validate TLS against platform roots, reject redirects and off-collection continuations, time out after 30 seconds, and limit each response to 1 MiB.
+HTTP errors, including authentication failures and throttling, are returned without automatic retries.
+The Graph bearer token is never stored or added to returned launch URLs, and it is **not** an RDP session credential.
+Browser authentication is independent of the discovery token.
+Live cloud interoperability still requires a licensed tenant, consent, assigned resources, and service access; offline tests do not establish those prerequisites.
+
+[Graph Cloud PC discovery]: https://learn.microsoft.com/graph/api/user-list-cloudpcs?view=graph-rest-1.0
+[Graph launch details]: https://learn.microsoft.com/graph/api/cloudpc-retrievecloudpclaunchdetail?view=graph-rest-1.0
+[Windows App]: https://learn.microsoft.com/windows-app/direct-launch-urls
+
 This crate is part of the [IronRDP] project.
 
 [IronRDP]: https://github.com/Devolutions/IronRDP
 [MS-RDPBCGR]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/
+[rcg-build]: https://docs.rs/ironrdp-connector#experimental-remote-credential-guard

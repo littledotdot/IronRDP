@@ -9,8 +9,12 @@
 
 #[cfg(feature = "sound")]
 pub mod audio;
+#[cfg(all(feature = "gateway", feature = "entra-auth"))]
+pub mod avd;
 #[cfg(feature = "camera")]
 pub mod camera;
+#[cfg(feature = "cloud")]
+pub mod cloud;
 pub mod config;
 pub mod egfx_cache;
 #[cfg(feature = "entra-auth")]
@@ -31,7 +35,16 @@ pub fn __test_apply_server_redirection(
     redirection::apply_server_redirection(config, redirection)
 }
 
-#[cfg(feature = "entra-auth")]
+#[cfg(feature = "__test")]
+#[doc(hidden)]
+pub fn __test_build_connector(
+    config: &config::Config,
+    auto_reconnect_cookie: Option<&ironrdp_pdu::rdp::session_info::ServerAutoReconnect>,
+) -> ironrdp_connector::ConnectorResult<ironrdp_connector::ClientConnector> {
+    rdp::__test_build_connector(config, auto_reconnect_cookie)
+}
+
+#[cfg(any(feature = "cloud", feature = "entra-auth"))]
 fn http_client_builder() -> std::io::Result<reqwest::ClientBuilder> {
     let builder = reqwest::Client::builder();
     #[cfg(feature = "rustls")]
