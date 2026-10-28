@@ -965,6 +965,10 @@ impl Daemon {
         let udp_transport = properties
             .get::<u32>("ironrdp_udp_transport")
             .is_some_and(|value| value != 0);
+        let egfx_requested = properties.get::<i64>("ironrdp_egfx").map(|value| value != 0);
+        // These are requested preferences, not proof of successful UDP channel migration
+        // or negotiated EGFX codec. Report actual protocol state separately during A/B tests.
+        info!(udp_requested = udp_transport, ?egfx_requested, "RDP transport and graphics preferences");
         let builder = builder
             .with_client_build(client_build())
             .with_client_dir("C:\\Windows\\System32\\mstscax.dll")
