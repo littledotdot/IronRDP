@@ -88,6 +88,9 @@ pub(crate) struct SendWindow {
     /// Next ChannelSeqNum to assign to new (non-retransmit) data.
     next_channel_seq: u64,
 
+    /// Windows UDP2 channel sequences skip zero at each 16-bit wrap.
+    skip_zero_channel_seq: bool,
+
     /// Total bytes currently in flight (state == Pending).
     bytes_in_flight: u64,
 
@@ -108,6 +111,7 @@ impl SendWindow {
             data_store: VecDeque::with_capacity(max_entries),
             next_data_seq: initial_data_seq,
             next_channel_seq: initial_channel_seq,
+            skip_zero_channel_seq: false,
             bytes_in_flight: 0,
             max_entries,
         }
@@ -173,9 +177,17 @@ impl SendWindow {
 
         self.next_data_seq += 1;
         self.next_channel_seq += 1;
+        if self.skip_zero_channel_seq && self.next_channel_seq & 0xffff == 0 {
+            self.next_channel_seq += 1;
+        }
         self.bytes_in_flight += u64::try_from(size).expect("packet size fits in u64");
 
         Some((data_seq, channel_seq))
+    }
+
+    /// Use the Windows UDP2 channel sequence space; legacy UDP retains zero.
+    pub(crate) fn use_nonzero_channel_seq(&mut self) {
+        self.skip_zero_channel_seq = true;
     }
 
     /// Record a retransmission with a preserved ChannelSeqNum.

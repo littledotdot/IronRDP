@@ -54,6 +54,9 @@ pub(crate) struct RecvWindow {
     /// Next ChannelSeqNum expected for in-order delivery.
     next_channel_seq: u64,
 
+    /// Windows UDP2 channel sequences skip zero at each 16-bit wrap.
+    skip_zero_channel_seq: bool,
+
     /// Out-of-order data buffered by ChannelSeqNum, waiting for gaps to fill.
     reorder_buf: BTreeMap<u64, Vec<u8>>,
 
@@ -74,6 +77,7 @@ impl RecvWindow {
             base_seq: initial_data_seq,
             highest_seq: initial_data_seq.saturating_sub(1),
             next_channel_seq: initial_channel_seq,
+            skip_zero_channel_seq: false,
             reorder_buf: BTreeMap::new(),
             max_entries,
         }
@@ -92,6 +96,10 @@ impl RecvWindow {
         // only ever removes at `next_channel_seq`, so an entry below that
         // would occupy a slot for the rest of the connection.
         let already_delivered = channel_seq < self.next_channel_seq;
+        let retired = data_seq < self.base_seq;
+        if retired && (already_delivered || self.reorder_buf.contains_key(&channel_seq)) {
+            return false;
+        }
 
         // The reorder buffer holds at most one entry per window slot. It
         // drains only at `next_channel_seq`, so a peer that keeps sending
@@ -119,7 +127,8 @@ impl RecvWindow {
             return false;
         }
 
-        if !self.occupy_slot(data_seq, Some(channel_seq)) {
+        // Windows can retire the data slot before delivering its reliable channel bytes.
+        if !retired && !self.occupy_slot(data_seq, Some(channel_seq)) {
             return false;
         }
 
@@ -229,6 +238,9 @@ impl RecvWindow {
         while let Some(data) = self.reorder_buf.remove(&self.next_channel_seq) {
             delivered.push(data);
             self.next_channel_seq += 1;
+            if self.skip_zero_channel_seq && self.next_channel_seq & 0xffff == 0 {
+                self.next_channel_seq += 1;
+            }
         }
 
         if !delivered.is_empty() {
@@ -350,6 +362,11 @@ impl RecvWindow {
     /// The next ChannelSeqNum expected for in-order delivery.
     pub(crate) fn next_channel_seq(&self) -> u64 {
         self.next_channel_seq
+    }
+
+    /// Use the Windows UDP2 channel sequence space; legacy UDP retains zero.
+    pub(crate) fn use_nonzero_channel_seq(&mut self) {
+        self.skip_zero_channel_seq = true;
     }
 
     /// Whether there are gaps in the received data (some pending slots

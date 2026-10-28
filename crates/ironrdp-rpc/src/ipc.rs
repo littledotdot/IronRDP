@@ -3376,8 +3376,8 @@ mod tests {
     use ironrdp_core::{decode, encode_vec};
 
     use super::{
-        KeyInput, MAX_KEY_BATCH_EVENTS, MAX_RAIL_EVENT_DUMP_EVENTS, RailEvent, RailEventDump, RailEventKind,
-        RailExecuteRequest, Request,
+        KeyInput, MAX_KEY_BATCH_EVENTS, MAX_RAIL_EVENT_DUMP_EVENTS, Payload, RailEvent, RailEventDump, RailEventKind,
+        RailExecuteRequest, Request, Response,
     };
 
     #[test]

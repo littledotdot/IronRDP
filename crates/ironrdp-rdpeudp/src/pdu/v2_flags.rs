@@ -33,12 +33,14 @@ bitflags! {
 
         /// DelayAckInfo payload (Section 2.2.1.2.3) is present.
         const DELAYACKINFO = 0x100;
+
+        /// Windows DATA marker when no cumulative ACK payload is attached.
+        const NOACK = 0x200;
     }
 }
 
-// This is the whole table. [MS-RDPEUDP2] 2.2.1.1 defines six flags and no
-// others, so a bit outside this set is one no peer will read and none of them
-// carries a meaning beyond "this payload is present".
+// NOACK is a Windows interoperability marker in addition to the six
+// payload-presence flags defined by [MS-RDPEUDP2] 2.2.1.1.
 //
 // Two absences are deliberate, because both were once defined here:
 //

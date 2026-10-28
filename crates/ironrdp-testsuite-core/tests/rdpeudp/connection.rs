@@ -55,6 +55,206 @@ fn syn_datagram(udp_ver: UdpVersion, cookie_hash: Option<[u8; 32]>) -> V1Datagra
 
 // ── Handshake tests ──
 
+// oracle: capture Windows 11 v3 SYN+ACK fixture from 4dc15b15; the final UDP2 ACK acknowledges zero.
+#[test]
+fn windows_v3_switches_to_udp2_after_syn_ack() {
+    let t = now();
+    let mut conn = RdpeudpConnection::connect(default_config(0), t).expect("connect");
+    conn.poll_transmit(t).expect("initial SYN");
+    let mut syn_ack = vec![0, 0, 0, 0, 0, 64, 16, 5, 48, 29, 123, 125, 4, 208, 4, 208, 0, 1, 1, 1];
+    conn.handle_datagram(&mut syn_ack, t).expect("Windows SYN+ACK");
+    let mut ack = conn.poll_transmit(t).expect("final ACK").contents;
+    let (_, bytes) = decode_with_prefix(&mut ack).expect("UDP2 final ACK prefix");
+    let ack: V2Packet = decode(bytes).expect("UDP2 final ACK");
+    assert_eq!(ack.ack.expect("acknowledgment").seq_num, 0);
+
+    conn.send(b"ClientHello".to_vec()).expect("send TLS data");
+    let mut data = conn.poll_transmit(t).expect("first TLS data").contents;
+    let (_, bytes) = decode_with_prefix(&mut data).expect("UDP2 data prefix");
+    let data: V2Packet = decode(bytes).expect("UDP2 data");
+    assert_eq!(data.data_header.expect("data header").data_seq_num, 0);
+    assert_eq!(data.data_body.expect("channel data").channel_seq_num, 1);
+
+    let packet = V2Packet {
+        header: V2Header {
+            flags: V2Flags::AOA | V2Flags::DATA,
+            log_window_size: 15,
+        },
+        ack: None,
+        overhead_size: None,
+        delay_ack_info: None,
+        ack_of_acks: Some(AckOfAcksPayload {
+            ack_of_acks_seq_num: 100,
+        }),
+        data_header: Some(DataHeader { data_seq_num: 100 }),
+        ack_vector: None,
+        data_body: Some(DataBody {
+            channel_seq_num: 1,
+            data: b"ServerHello".to_vec(),
+        }),
+    };
+    let mut wire = Vec::new();
+    encode_with_prefix(&encode_vec(&packet).expect("encode server data"), false, &mut wire).expect("server prefix");
+    conn.handle_datagram(&mut wire, t).expect("receive Windows data");
+    assert_eq!(conn.poll_event(), Some(Event::Connected));
+    assert_eq!(conn.poll_event(), Some(Event::DataReceived(b"ServerHello".to_vec())));
+}
+
+// oracle: spec MS-RDPEUDP2 Appendix A, note 1: Windows channel sequences skip zero; data sequences do not.
+#[test]
+fn windows_v3_channel_wrap_delivers_without_channel_zero() {
+    let t = now();
+    let mut conn = RdpeudpConnection::connect(default_config(0), t).expect("connect");
+    conn.poll_transmit(t).expect("initial SYN");
+    let mut syn_ack = vec![0, 0, 0, 0, 0, 64, 16, 5, 48, 29, 123, 125, 4, 208, 4, 208, 0, 1, 1, 1];
+    conn.handle_datagram(&mut syn_ack, t).expect("Windows SYN+ACK");
+    conn.poll_transmit(t).expect("final ACK");
+    assert_eq!(conn.poll_event(), Some(Event::Connected));
+
+    for index in 0..131_075u64 {
+        let data = index.to_le_bytes().to_vec();
+        let seq = u16::try_from(index & 0xffff).expect("data sequence");
+        let packet = V2Packet {
+            header: V2Header {
+                flags: V2Flags::AOA | V2Flags::DATA,
+                log_window_size: 15,
+            },
+            ack: None,
+            overhead_size: None,
+            delay_ack_info: None,
+            ack_of_acks: Some(AckOfAcksPayload {
+                ack_of_acks_seq_num: seq,
+            }),
+            data_header: Some(DataHeader { data_seq_num: seq }),
+            ack_vector: None,
+            data_body: Some(DataBody {
+                channel_seq_num: u16::try_from(index % 65_535 + 1).expect("channel sequence"),
+                data: data.clone(),
+            }),
+        };
+        let mut wire = Vec::new();
+        encode_with_prefix(&encode_vec(&packet).expect("encode data"), false, &mut wire).expect("prefix");
+        conn.handle_datagram(&mut wire, t).expect("Windows data");
+        assert_eq!(conn.poll_event(), Some(Event::DataReceived(data)), "packet {index}");
+        while conn.poll_transmit(t).is_some() {}
+    }
+}
+
+// oracle: spec MS-RDPEUDP2 Appendix A, note 1: Windows channel numbering skips zero.
+#[test]
+fn windows_v3_sender_skips_channel_zero_at_wrap() {
+    let (mut conn, _peer, t) = establish_pair();
+    for index in 0..65_537u64 {
+        conn.send(vec![1]).expect("send data");
+        let mut wire = conn.poll_transmit(t).expect("data packet").contents;
+        let (_, bytes) = decode_with_prefix(&mut wire).expect("data prefix");
+        let packet: V2Packet = decode(bytes).expect("data packet");
+        assert_eq!(
+            packet.data_body.expect("channel data").channel_seq_num,
+            u16::try_from(index % 65_535 + 1).expect("channel sequence"),
+            "packet {index}"
+        );
+        let packet = V2Packet {
+            header: V2Header {
+                flags: V2Flags::ACK,
+                log_window_size: 6,
+            },
+            ack: Some(AckPayload {
+                seq_num: u16::try_from(index & 0xffff).expect("data sequence"),
+                received_ts: 0,
+                send_ack_time_gap: 0,
+                delay_ack_time_scale: 0,
+                delay_ack_time_additions: Vec::new(),
+            }),
+            overhead_size: None,
+            delay_ack_info: None,
+            ack_of_acks: None,
+            data_header: None,
+            ack_vector: None,
+            data_body: None,
+        };
+        let mut wire = Vec::new();
+        encode_with_prefix(&encode_vec(&packet).expect("encode ACK"), false, &mut wire).expect("ACK prefix");
+        conn.handle_datagram(&mut wire, t).expect("acknowledge data");
+    }
+}
+
+// oracle: reference FreeRDP v3_on_data delivers Windows data older than AckOfAcks without re-ACKing it.
+#[test]
+fn windows_data_behind_ack_of_acks_still_reaches_the_stream() {
+    let (mut conn, _peer, t) = establish_pair();
+    let packet = V2Packet {
+        header: V2Header {
+            flags: V2Flags::AOA | V2Flags::DATA,
+            log_window_size: 15,
+        },
+        ack: None,
+        overhead_size: None,
+        delay_ack_info: None,
+        ack_of_acks: Some(AckOfAcksPayload {
+            ack_of_acks_seq_num: 101,
+        }),
+        data_header: Some(DataHeader { data_seq_num: 100 }),
+        ack_vector: None,
+        data_body: Some(DataBody {
+            channel_seq_num: 1,
+            data: b"ServerHello".to_vec(),
+        }),
+    };
+    let mut wire = Vec::new();
+    encode_with_prefix(&encode_vec(&packet).expect("encode Windows data"), false, &mut wire).expect("prefix");
+    conn.handle_datagram(&mut wire, t)
+        .expect("receive retired Windows data");
+    assert_eq!(conn.poll_event(), Some(Event::DataReceived(b"ServerHello".to_vec())));
+    assert!(
+        conn.poll_transmit(t).is_none(),
+        "retired data must not be acknowledged again"
+    );
+}
+
+// oracle: reference FreeRDP 5e0bebc3 rdpudp.c v3_send_data sets NOACK when no ACK is attached.
+#[test]
+fn windows_v3_data_marks_an_absent_ack() {
+    let (mut conn, _peer, t) = establish_pair();
+    conn.send(vec![1]).expect("send data");
+    let mut wire = conn.poll_transmit(t).expect("data packet").contents;
+    let (_, bytes) = decode_with_prefix(&mut wire).expect("data prefix");
+    let flags = u16::from_le_bytes([bytes[0], bytes[1]]);
+    assert_ne!(flags & 0x200, 0, "Windows NOACK marker");
+    assert_eq!(flags & 1, 0, "no cumulative ACK payload");
+}
+
+// oracle: reference FreeRDP 5e0bebc3 v3_send_ack_vector emits ACKVEC without an AckOfAcks payload.
+#[test]
+fn windows_ack_vector_does_not_repeat_ack_of_acks() {
+    let (mut conn, mut peer, t) = establish_pair();
+    let t = later(t, 500);
+    conn.send(vec![1]).expect("send lost data");
+    conn.poll_transmit(t).expect("drop data");
+    let mut retry = advance_to_retransmit(&mut conn).expect("retransmit with AckOfAcks");
+    let (_, bytes) = decode_with_prefix(&mut retry).expect("retry prefix");
+    let retry: V2Packet = decode(bytes).expect("retry packet");
+    assert!(retry.ack_of_acks.is_some());
+    let t = later(t, 1000);
+    for _ in 0..3 {
+        peer.send(vec![2]).expect("peer data");
+    }
+    peer.poll_transmit(t).expect("drop first peer packet");
+    peer.poll_transmit(t).expect("drop second peer packet");
+    let mut wire = peer.poll_transmit(t).expect("third peer packet").contents;
+    conn.handle_datagram(&mut wire, t).expect("receive third peer packet");
+    let due = conn.poll_timeout().expect("ACK deadline");
+    conn.handle_timeout(due);
+    let mut wire = conn.poll_transmit(due).expect("ACK vector").contents;
+    let (_, bytes) = decode_with_prefix(&mut wire).expect("ACK prefix");
+    let packet: V2Packet = decode(bytes).expect("ACK packet");
+    assert!(packet.ack_vector.is_some(), "selective ACK must describe the gap");
+    assert!(
+        packet.ack_of_acks.is_none(),
+        "Windows ACK vector must not repeat AckOfAcks"
+    );
+}
+
 #[test]
 fn client_connect_produces_syn() {
     let t = now();
@@ -582,7 +782,7 @@ fn handle_datagram_after_close_returns_error() {
 #[test]
 fn config_default() {
     let config = ConnectionConfig::default();
-    assert_eq!(config.log_window_size, 6);
+    assert_eq!(config.log_window_size, 15);
     assert_eq!(config.upstream_mtu, 1232);
     assert_eq!(config.downstream_mtu, 1232);
     assert_eq!(config.idle_timeout, Duration::from_secs(65));

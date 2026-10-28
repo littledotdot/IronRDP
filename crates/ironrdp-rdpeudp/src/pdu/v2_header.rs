@@ -219,18 +219,17 @@ mod tests {
 
     #[test]
     fn flags_only_lower_12_bits() {
-        // The six flags [MS-RDPEUDP2] 2.2.1.1 defines and no others:
-        // 0x001, 0x004, 0x008, 0x010, 0x040, 0x100 = 0x15D.
+        // The six payload flags plus Windows' NOACK marker occupy 0x35D.
         // from_bits_truncate drops undefined bit positions.
         let all_defined = V2Flags::all();
-        assert_eq!(all_defined.bits(), 0x15D);
+        assert_eq!(all_defined.bits(), 0x35D);
 
         let header = V2Header {
             flags: all_defined,
             log_window_size: 0xF,
         };
         let wire = header.to_wire();
-        assert_eq!(wire, 0xF15D); // 0x15D | (0xF << 12)
+        assert_eq!(wire, 0xF35D); // 0x35D | (0xF << 12)
 
         // Can't decode all_defined because ACK and ACKVEC are both set.
         // Test with valid flags to verify the bit separation.

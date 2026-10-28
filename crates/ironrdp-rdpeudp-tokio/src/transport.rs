@@ -1012,7 +1012,12 @@ where
 /// later. The sans-I/O crate takes the finished hash and stays free of any
 /// cryptographic dependency.
 fn cookie_hash(tunnel_config: &TunnelConfig) -> [u8; 32] {
-    Sha256::digest(tunnel_config.security_cookie).into()
+    let mut hash: [u8; 32] = Sha256::digest(tunnel_config.security_cookie).into();
+    // Windows encodes each little-endian digest word in network byte order.
+    for word in hash.chunks_exact_mut(4) {
+        word.reverse();
+    }
+    hash
 }
 
 #[cfg(test)]
@@ -1020,6 +1025,34 @@ mod tests {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    // oracle: reference Windows v3 accepted-cookie fixture from 4dc15b15, cookie_hash_matches_windows_v3_wire_order.
+    #[tokio::test]
+    async fn client_syn_uses_windows_cookie_hash_word_order() {
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let config = UdpTransportConfig::new(
+            peer.local_addr().expect("peer address"),
+            "localhost".into(),
+            TunnelConfig {
+                request_id: 1,
+                security_cookie: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+            },
+        );
+        let connection = tokio::spawn(connect_udp(config));
+        let mut datagram = [0; 1232];
+        let received = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut datagram)).await;
+        connection.abort();
+        let _ = connection.await;
+        let received = received.expect("SYN deadline").expect("receive SYN");
+        assert!(52 <= received);
+        assert_eq!(
+            &datagram[20..52],
+            &[
+                0x26, 0xcb, 0x45, 0xbe, 0xbe, 0x36, 0xbf, 0x05, 0x84, 0x84, 0xe6, 0xbd, 0xfd, 0xf0, 0x28, 0x1a, 0x50,
+                0x98, 0xc6, 0x43, 0xfe, 0xe5, 0xdc, 0xa3, 0x28, 0x99, 0xa6, 0xdb, 0x91, 0x89, 0x3a, 0xee,
+            ]
+        );
+    }
 
     // oracle: mutant connect_udp_with_socket allows mismatched socket and peer address families
     #[tokio::test]

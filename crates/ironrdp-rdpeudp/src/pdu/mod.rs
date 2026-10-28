@@ -3,10 +3,9 @@
 //! V1 handshake format (MS-RDPEUDP Section 2.2) and
 //! V2 data transfer format (MS-RDPEUDP2 Section 2.2).
 //!
-//! The v1 format is used for the three-way handshake (SYN/SYN+ACK/ACK)
-//! even when both sides negotiate v2+ for data transfer. Once the
-//! handshake completes, all subsequent packets use the v2 wire format
-//! from MS-RDPEUDP2.
+//! SYN and SYN+ACK use the v1 format. A version 3 negotiation switches
+//! to MS-RDPEUDP2 for the final ACK and data transfer; legacy versions
+//! retain the v1 format throughout.
 //!
 //! Types are organized by protocol version:
 //! - `v1_*` modules: MS-RDPEUDP handshake structures.
@@ -402,9 +401,7 @@ impl V2Packet {
 
     /// Compute flags from populated fields.
     ///
-    /// Every flag [MS-RDPEUDP2] 2.2.1.1 defines announces a payload, so there
-    /// is nothing to carry over from the caller's header: what is present
-    /// determines the field completely.
+    /// Payload presence also determines Windows' NOACK marker on DATA.
     fn compute_flags(&self) -> V2Flags {
         let mut flags = V2Flags::empty();
 
@@ -422,6 +419,9 @@ impl V2Packet {
         }
         if self.data_header.is_some() {
             flags |= V2Flags::DATA;
+            if self.ack.is_none() {
+                flags |= V2Flags::NOACK;
+            }
         }
         if self.ack_vector.is_some() {
             flags |= V2Flags::ACKVEC;

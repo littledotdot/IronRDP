@@ -40,7 +40,7 @@ fn v2_ack_only_roundtrip() {
 fn v2_data_only_roundtrip() {
     let packet = V2Packet {
         header: V2Header {
-            flags: V2Flags::DATA,
+            flags: V2Flags::DATA | V2Flags::NOACK,
             log_window_size: 8,
         },
         ack: None,
@@ -423,7 +423,7 @@ fn v2_data_body_consumes_remaining() {
 fn v2_ackvec_with_data_roundtrip() {
     let packet = V2Packet {
         header: V2Header {
-            flags: V2Flags::ACKVEC | V2Flags::DATA,
+            flags: V2Flags::ACKVEC | V2Flags::DATA | V2Flags::NOACK,
             log_window_size: 6,
         },
         ack: None,
@@ -472,7 +472,7 @@ fn v2_header_flags_match_the_spec_table() {
 fn v2_large_data_packet_roundtrip() {
     let packet = V2Packet {
         header: V2Header {
-            flags: V2Flags::DATA,
+            flags: V2Flags::DATA | V2Flags::NOACK,
             log_window_size: 10,
         },
         ack: None,

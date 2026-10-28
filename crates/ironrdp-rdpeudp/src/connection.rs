@@ -16,7 +16,7 @@
 //!
 //! # V1/V2 packet discrimination
 //!
-//! The v1 wire format is used for the three-way handshake (SYN/SYN+ACK/ACK).
+//! SYN and SYN+ACK use the v1 wire format; version 3 switches to UDP2 for the final ACK.
 //! Once established, all packets use the v2 format with the PacketPrefixByte
 //! framing from MS-RDPEUDP2 Section 2.2.1.3.
 
@@ -148,7 +148,8 @@ impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
             initial_sequence_number: 0,
-            log_window_size: 6,
+            // UNTESTED: Windows graphics bursts need this bounded maximum; recheck native-server traffic when changing it.
+            log_window_size: 15,
             upstream_mtu: 1232,
             downstream_mtu: 1232,
             idle_timeout: Duration::from_secs(65),
@@ -1299,7 +1300,7 @@ impl RdpeudpConnection {
         self.sample_handshake_rtt(now);
 
         // Send final ACK to complete handshake
-        self.enqueue_final_ack(remote_isn);
+        self.enqueue_final_ack(remote_isn, now);
 
         // Transition to established
         self.transition_to_established(now);
@@ -1309,21 +1310,41 @@ impl RdpeudpConnection {
 
     /// Server receives the client's final ACK.
     fn handle_final_ack(&mut self, wire: &[u8], now: MonotonicInstant) -> Result<(), RdpeudpError> {
-        let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
+        // A repeated SYN retains its v1 header. Its SYN flag is at bit 0
+        // of byte 7; a valid UDP2 prefix has that reserved bit cleared.
+        let repeated_syn = wire.get(7).is_some_and(|byte| byte & 1 != 0);
+        if self
+            .params
+            .as_ref()
+            .is_some_and(|params| matches!(params.wire, WireFormat::V2))
+            && !repeated_syn
+        {
+            let mut bytes = wire.to_vec();
+            let (_, packet) = decode_with_prefix(&mut bytes).map_err(RdpeudpError::prefix)?;
+            let packet: V2Packet = decode(packet).map_err(RdpeudpError::decode)?;
+            if packet.ack.is_none_or(|ack| ack.seq_num != 0) {
+                return Err(RdpeudpError::invalid_packet(
+                    "handle final ACK",
+                    "expected UDP2 ACK for sequence 0",
+                ));
+            }
+        } else {
+            let datagram: V1Datagram = decode(wire).map_err(RdpeudpError::decode)?;
 
-        // The client repeats its SYN when our SYN+ACK goes missing. Answer it
-        // again rather than reading it as a protocol violation.
-        if datagram.header.flags.contains(V1Flags::SYN) {
-            debug!("Client repeated SYN, resending SYN+ACK");
-            self.resend_handshake_datagram();
-            return Ok(());
-        }
+            // The client repeats its SYN when our SYN+ACK goes missing. Answer it
+            // again rather than reading it as a protocol violation.
+            if datagram.header.flags.contains(V1Flags::SYN) {
+                debug!("Client repeated SYN, resending SYN+ACK");
+                self.resend_handshake_datagram();
+                return Ok(());
+            }
 
-        if !datagram.header.flags.contains(V1Flags::ACK) {
-            return Err(RdpeudpError::invalid_packet(
-                "handle final ACK",
-                "expected ACK during handshake",
-            ));
+            if !datagram.header.flags.contains(V1Flags::ACK) {
+                return Err(RdpeudpError::invalid_packet(
+                    "handle final ACK",
+                    "expected ACK during handshake",
+                ));
+            }
         }
 
         debug!("Received final ACK");
@@ -1335,7 +1356,42 @@ impl RdpeudpConnection {
     }
 
     /// Build and enqueue the client's final ACK.
-    fn enqueue_final_ack(&mut self, remote_isn: u32) {
+    fn enqueue_final_ack(&mut self, remote_isn: u32, now: MonotonicInstant) {
+        if self
+            .params
+            .as_ref()
+            .is_some_and(|params| matches!(params.wire, WireFormat::V2))
+        {
+            // Windows switches to RDPEUDP2 immediately after its v3 SYN+ACK.
+            // This ACK confirms the new transport's initial sequence 0.
+            let packet = V2Packet {
+                header: V2Header {
+                    flags: V2Flags::ACK,
+                    log_window_size: self.config.log_window_size,
+                },
+                ack: Some(AckPayload {
+                    seq_num: 0,
+                    received_ts: seq::truncate_timestamp(Self::timestamp_units(now)),
+                    send_ack_time_gap: 0,
+                    delay_ack_time_scale: 0,
+                    delay_ack_time_additions: Vec::new(),
+                }),
+                overhead_size: None,
+                delay_ack_info: None,
+                ack_of_acks: None,
+                data_header: None,
+                ack_vector: None,
+                data_body: None,
+            };
+            if let Some(transmit) = self.encode_v2_packet(&packet) {
+                self.handshake_datagram = Some(transmit.contents.clone());
+                self.handshake_retransmits = 0;
+                self.pending_transmits.push_back(transmit);
+            } else {
+                self.close();
+            }
+            return;
+        }
         let datagram = V1Datagram {
             header: FecHeader {
                 sn_source_ack: remote_isn,
@@ -1405,16 +1461,19 @@ impl RdpeudpConnection {
             .as_ref()
             .expect("params must be set before transitioning to established");
 
-        // Data sequence numbers start at ISN + 1
-        let local_initial_data_seq = u64::from(params.local_isn) + 1;
-        let remote_initial_data_seq = u64::from(params.remote_isn) + 1;
-
-        // MS-RDPEUDP2 numbers channel data from 1. MS-RDPEUDP (3.1.1.2) has a single
-        // Source sequence space starting at the ISN + 1, so both windows use it.
-        let (local_initial_channel_seq, remote_initial_channel_seq) = match params.wire {
-            WireFormat::V1 { .. } => (local_initial_data_seq, remote_initial_data_seq),
-            WireFormat::V2 => (1u64, 1u64),
-        };
+        // RDPEUDP2 has a fresh, zero-based data sequence space, while the
+        // channel sequence space starts at 1. The peer advances its data
+        // lower bound with AckOfAcks. Only the legacy wire format continues
+        // the SYN sequence numbers.
+        let (local_initial_data_seq, remote_initial_data_seq, local_initial_channel_seq, remote_initial_channel_seq) =
+            match params.wire {
+                WireFormat::V1 { .. } => {
+                    let local = u64::from(params.local_isn) + 1;
+                    let remote = u64::from(params.remote_isn) + 1;
+                    (local, remote, local, remote)
+                }
+                WireFormat::V2 => (0, 0, 1, 1),
+            };
         if let WireFormat::V1 { .. } = params.wire {
             self.v1_next_coded = params.local_isn.wrapping_add(1);
         }
@@ -1429,17 +1488,23 @@ impl RdpeudpConnection {
             "Connection established"
         );
 
-        self.send_window = Some(SendWindow::new(
+        let mut send_window = SendWindow::new(
             local_initial_data_seq,
             local_initial_channel_seq,
             params.log_window_size,
-        ));
+        );
 
-        self.recv_window = Some(RecvWindow::new(
+        let mut recv_window = RecvWindow::new(
             remote_initial_data_seq,
             remote_initial_channel_seq,
             params.log_window_size,
-        ));
+        );
+        if params.wire == WireFormat::V2 {
+            send_window.use_nonzero_channel_seq();
+            recv_window.use_nonzero_channel_seq();
+        }
+        self.send_window = Some(send_window);
+        self.recv_window = Some(recv_window);
 
         self.timers.set(Timer::Idle, now + self.config.idle_timeout);
         self.timers.set(Timer::KeepAlive, now + self.config.keep_alive_interval);
@@ -1732,6 +1797,7 @@ impl RdpeudpConnection {
 
         let reference_channel = recv_window.next_channel_seq();
         let channel_seq = seq::reconstruct_seq(db.channel_seq_num, reference_channel);
+        let acknowledge = recv_window.base_seq() <= data_seq;
 
         // Record the packet in the receive window
         let is_new = recv_window.receive(data_seq, channel_seq, db.data.clone());
@@ -1751,8 +1817,10 @@ impl RdpeudpConnection {
             }
 
             // Schedule ACK (either piggybacked on next data or standalone)
-            self.ack_pending = true;
-            self.arm_ack_delay(now);
+            if acknowledge {
+                self.ack_pending = true;
+                self.arm_ack_delay(now);
+            }
         }
     }
 
@@ -2008,9 +2076,12 @@ impl RdpeudpConnection {
         };
 
         // AckOfAcks if pending
-        let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
-            ack_of_acks_seq_num: seq::truncate_seq(seq),
-        });
+        let ack_of_acks = self
+            .pending_ack_of_acks
+            .filter(|_| ack_vector.is_none())
+            .map(|seq| AckOfAcksPayload {
+                ack_of_acks_seq_num: seq::truncate_seq(seq),
+            });
         if ack_of_acks.is_some() {
             flags |= V2Flags::AOA;
         }
@@ -2066,9 +2137,12 @@ impl RdpeudpConnection {
         let mut flags = acknowledgement.flag;
         let (ack, ack_vector) = (acknowledgement.ack, acknowledgement.ack_vector);
 
-        let ack_of_acks = self.pending_ack_of_acks.map(|seq| AckOfAcksPayload {
-            ack_of_acks_seq_num: seq::truncate_seq(seq),
-        });
+        let ack_of_acks = self
+            .pending_ack_of_acks
+            .filter(|_| ack_vector.is_none())
+            .map(|seq| AckOfAcksPayload {
+                ack_of_acks_seq_num: seq::truncate_seq(seq),
+            });
         if ack_of_acks.is_some() {
             flags |= V2Flags::AOA;
         }
