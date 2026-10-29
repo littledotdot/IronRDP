@@ -75,6 +75,7 @@ cloud = [
     "dep:serde_json",
 ]
 udp = [
+    "dep:ironrdp-rdpemt",
     "dep:ironrdp-rdpeudp",
     "dep:ironrdp-rdpeudp-tokio",
     "ironrdp-rdpeudp-tokio/rustls-aws-lc-rs",
@@ -122,6 +123,7 @@ ironrdp-displaycontrol = { path = "../ironrdp-displaycontrol", version = "0.10" 
 ironrdp-echo = { path = "../ironrdp-echo", version = "0.6" }
 ironrdp-egfx = { path = "../ironrdp-egfx", version = "0.5" } # public
 ironrdp-rdpei = { path = "../ironrdp-rdpei", version = "0.3" } # public
+ironrdp-rdpemt = { path = "../ironrdp-rdpemt", version = "0.1", optional = true }
 ironrdp-rdpeudp = { path = "../ironrdp-rdpeudp", version = "0.1", optional = true }
 ironrdp-rdpeudp-tokio = { path = "../ironrdp-rdpeudp-tokio", version = "0.2", optional = true }
 ironrdp-tls = { path = "../ironrdp-tls", version = "0.3" } # public
