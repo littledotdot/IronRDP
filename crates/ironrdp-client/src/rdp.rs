@@ -5841,6 +5841,79 @@ mod tests {
 
     use super::*;
 
+    #[cfg(feature = "udp")]
+    fn udp_request_header(request: AutoDetectRequest) -> TunnelSubHeader {
+        let bytes = encode_vec(&request).expect("encode auto-detect request");
+        assert_eq!(bytes[1], SubHeaderType::AutoDetectRequest.to_u8());
+        TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            data: bytes[2..].to_vec(),
+        }
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn udp_rtt_subheader_has_a_tunnel_response_with_original_sequence() {
+        use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
+        let request = udp_request_header(AutoDetectRequest::rtt_continuous(0x1234));
+        let mut responder = AutoDetectResponder::default();
+        let replies = udp_autodetect_responses(
+            &[request], &mut responder, MonotonicInstant::from_millis(100),
+        );
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].sub_header_type, SubHeaderType::AutoDetectResponse);
+        // SubHeaderLength/Type on the wire must be the same two bytes as
+        // the MS-RDPBCGR auto-detect response header, not repeated inside data.
+        let mut wire = vec![
+            u8::try_from(replies[0].wire_size()).expect("response size fits"),
+            replies[0].sub_header_type.to_u8(),
+        ];
+        wire.extend_from_slice(&replies[0].data);
+        let decoded = decode::<AutoDetectResponse>(&wire).expect("decode response");
+        assert_eq!(decoded, AutoDetectResponse::RttResponse { sequence_number: 0x1234 });
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn udp_bandwidth_start_stop_replies_on_tunnel_even_without_dvc_data() {
+        use ironrdp_pdu::rdp::autodetect::{AutoDetectResponse, BW_RESULTS_CONTINUOUS};
+        let mut responder = AutoDetectResponder::default();
+        let start = udp_request_header(AutoDetectRequest::bw_start_continuous(15));
+        assert!(udp_autodetect_responses(
+            &[start], &mut responder, MonotonicInstant::from_millis(100),
+        ).is_empty());
+        responder.record_bytes(1024);
+        let stop = udp_request_header(AutoDetectRequest::bw_stop_continuous(15));
+        let replies = udp_autodetect_responses(
+            &[stop], &mut responder, MonotonicInstant::from_millis(250),
+        );
+        assert_eq!(replies.len(), 1);
+        let mut wire = vec![u8::try_from(replies[0].wire_size()).expect("size"), replies[0].sub_header_type.to_u8()];
+        wire.extend_from_slice(&replies[0].data);
+        assert_eq!(
+            decode::<AutoDetectResponse>(&wire).expect("decode results"),
+            AutoDetectResponse::BandwidthMeasureResults {
+                sequence_number: 15,
+                response_type: BW_RESULTS_CONTINUOUS,
+                time_delta_ms: 150,
+                byte_count: 1024,
+            }
+        );
+    }
+
+    #[cfg(feature = "udp")]
+    #[test]
+    fn malformed_udp_autodetect_subheader_does_not_end_rdp_session() {
+        let invalid = TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectRequest,
+            data: vec![0, 0],
+        };
+        let mut responder = AutoDetectResponder::default();
+        assert!(udp_autodetect_responses(
+            &[invalid], &mut responder, MonotonicInstant::from_millis(10)
+        ).is_empty());
+    }
+
     fn mouse_move(x: u16, y: u16) -> FastPathInputEvent {
         FastPathInputEvent::MouseEvent(MousePdu {
             flags: PointerFlags::MOVE,
