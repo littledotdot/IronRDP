@@ -24,6 +24,7 @@ pub use active_stage::{
     ActiveStage, ActiveStageBuilder, ActiveStageOutput, CompositedGraphics, GracefulDisconnectReason,
     composite_graphics_pipeline,
 };
+pub use autodetect::AutoDetectResponder;
 pub use fast_path::{BulkDecompressionErrorKind, FastPathBulkDecompressionFailure};
 #[cfg(all(feature = "__test", feature = "qoiz"))]
 pub use qoiz::Decompressor as QoizDecompressor;
