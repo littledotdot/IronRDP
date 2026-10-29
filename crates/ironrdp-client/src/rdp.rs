@@ -21,8 +21,6 @@ pub use ironrdp_cliprdr::backend::CliprdrBackendFactory;
 use ironrdp_connector::connection_activation::ConnectionActivationState;
 use ironrdp_connector::{ConnectionOutcome, ConnectionResult, ConnectorResult};
 use ironrdp_core::WriteBuf;
-#[cfg(feature = "udp")]
-use ironrdp_core::{MonotonicInstant, decode, encode_vec};
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, MonitorLayoutEntry};
 #[cfg(all(windows, feature = "dvc-com-plugin"))]
@@ -48,8 +46,6 @@ use ironrdp_pdu::input::mouse_rel::{MouseRelPdu, PointerRelFlags};
 use ironrdp_pdu::pdu_other_err;
 use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
 #[cfg(feature = "udp")]
-use ironrdp_rdpemt::{SubHeaderType, TunnelSubHeader};
-#[cfg(feature = "udp")]
 use ironrdp_rdpeudp_tokio::TunnelMessage;
 use ironrdp_pdu::rdp::capability_sets::InputFlags;
 use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
@@ -69,8 +65,6 @@ use ironrdp_session::{
     ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, SessionError, SessionErrorExt as _,
     SessionResult,
 };
-#[cfg(feature = "udp")]
-use ironrdp_session::AutoDetectResponder;
 use ironrdp_svc::SvcMessage;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
@@ -94,6 +88,18 @@ use ironrdp_dvc_pipe_proxy::DvcNamedPipeProxy;
 use ironrdp_rdpewa::{RdpewaClient, RdpewaClientListener};
 #[cfg(all(windows, feature = "webauthn"))]
 use ironrdp_rdpewa_native::{WindowsRdpewaBackend, WindowsRdpewaSessionState};
+
+#[cfg(feature = "udp")]
+#[path = "udp_autodetect.rs"]
+mod udp_autodetect;
+#[cfg(feature = "udp")]
+use self::udp_autodetect::udp_autodetect_responses;
+#[cfg(feature = "udp")]
+use ironrdp_core::MonotonicInstant;
+#[cfg(feature = "udp")]
+use ironrdp_rdpeudp_tokio::TunnelMessage;
+#[cfg(feature = "udp")]
+use ironrdp_session::AutoDetectResponder;
 
 use crate::config::{Config, RDCleanPathConfig, Transport};
 use crate::rail::{RailClient, RailControlEvent, RailEvent, RailInputEvent, RailSvcMessages};
@@ -3933,59 +3939,6 @@ enum RdpControlFlow {
     ServerRedirection(Box<ServerRedirectionPdu>),
 }
 
-// The RDPEMT subheader is the complete MS-RDPBCGR auto-detect header:
-// SubHeaderLength/Type are also autoDetectReq.headerLength/headerTypeId.
-// Preserve it rather than using UdpTransport::recv(), which drops the
-// subheaders and leaves the server's UDP RTT/bandwidth probes unanswered.
-#[cfg(feature = "udp")]
-fn udp_autodetect_responses(
-    sub_headers: &[TunnelSubHeader],
-    responder: &mut AutoDetectResponder,
-    now: MonotonicInstant,
-) -> Vec<TunnelSubHeader> {
-    let mut replies = Vec::new();
-    for header in sub_headers {
-        if header.sub_header_type != SubHeaderType::AutoDetectRequest {
-            continue;
-        }
-        let Ok(length) = u8::try_from(header.wire_size()) else {
-            warn!("Ignoring oversized RDPEMT auto-detect subheader");
-            continue;
-        };
-        let mut encoded = Vec::with_capacity(header.wire_size());
-        encoded.extend_from_slice(&[length, SubHeaderType::AutoDetectRequest.to_u8()]);
-        encoded.extend_from_slice(&header.data);
-        let request = match decode::<AutoDetectRequest>(&encoded) {
-            Ok(request) => request,
-            Err(error) => {
-                warn!(%error, length = encoded.len(), "Ignoring invalid UDP auto-detect request");
-                continue;
-            }
-        };
-        let Some(response) = responder.respond(request, Some(now)) else {
-            continue;
-        };
-        // AutoDetectResponse already encodes the same two-byte
-        // headerLength/headerTypeId that RDPEMT uses for its subheader.
-        let data = match encode_vec(&response) {
-            Ok(data) => data,
-            Err(error) => {
-                warn!(%error, "Failed to encode UDP auto-detect response");
-                continue;
-            }
-        };
-        if data.len() < 2 || data[1] != SubHeaderType::AutoDetectResponse.to_u8() {
-            warn!("Ignoring invalid encoded UDP auto-detect response");
-            continue;
-        }
-        replies.push(TunnelSubHeader {
-            sub_header_type: SubHeaderType::AutoDetectResponse,
-            data: data[2..].to_vec(),
-        });
-    }
-    replies
-}
-
 struct ActiveSessionIteration {
     outputs: Vec<ActiveStageOutput>,
     dvc_batch: Option<DvcMessageBatch>,
@@ -5840,79 +5793,6 @@ mod tests {
     use ironrdp_svc::{StaticChannelSet, SvcProcessor as _};
 
     use super::*;
-
-    #[cfg(feature = "udp")]
-    fn udp_request_header(request: AutoDetectRequest) -> TunnelSubHeader {
-        let bytes = encode_vec(&request).expect("encode auto-detect request");
-        assert_eq!(bytes[1], SubHeaderType::AutoDetectRequest.to_u8());
-        TunnelSubHeader {
-            sub_header_type: SubHeaderType::AutoDetectRequest,
-            data: bytes[2..].to_vec(),
-        }
-    }
-
-    #[cfg(feature = "udp")]
-    #[test]
-    fn udp_rtt_subheader_has_a_tunnel_response_with_original_sequence() {
-        use ironrdp_pdu::rdp::autodetect::AutoDetectResponse;
-        let request = udp_request_header(AutoDetectRequest::rtt_continuous(0x1234));
-        let mut responder = AutoDetectResponder::default();
-        let replies = udp_autodetect_responses(
-            &[request], &mut responder, MonotonicInstant::from_millis(100),
-        );
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0].sub_header_type, SubHeaderType::AutoDetectResponse);
-        // SubHeaderLength/Type on the wire must be the same two bytes as
-        // the MS-RDPBCGR auto-detect response header, not repeated inside data.
-        let mut wire = vec![
-            u8::try_from(replies[0].wire_size()).expect("response size fits"),
-            replies[0].sub_header_type.to_u8(),
-        ];
-        wire.extend_from_slice(&replies[0].data);
-        let decoded = decode::<AutoDetectResponse>(&wire).expect("decode response");
-        assert_eq!(decoded, AutoDetectResponse::RttResponse { sequence_number: 0x1234 });
-    }
-
-    #[cfg(feature = "udp")]
-    #[test]
-    fn udp_bandwidth_start_stop_replies_on_tunnel_even_without_dvc_data() {
-        use ironrdp_pdu::rdp::autodetect::{AutoDetectResponse, BW_RESULTS_CONTINUOUS};
-        let mut responder = AutoDetectResponder::default();
-        let start = udp_request_header(AutoDetectRequest::bw_start_continuous(15));
-        assert!(udp_autodetect_responses(
-            &[start], &mut responder, MonotonicInstant::from_millis(100),
-        ).is_empty());
-        responder.record_bytes(1024);
-        let stop = udp_request_header(AutoDetectRequest::bw_stop_continuous(15));
-        let replies = udp_autodetect_responses(
-            &[stop], &mut responder, MonotonicInstant::from_millis(250),
-        );
-        assert_eq!(replies.len(), 1);
-        let mut wire = vec![u8::try_from(replies[0].wire_size()).expect("size"), replies[0].sub_header_type.to_u8()];
-        wire.extend_from_slice(&replies[0].data);
-        assert_eq!(
-            decode::<AutoDetectResponse>(&wire).expect("decode results"),
-            AutoDetectResponse::BandwidthMeasureResults {
-                sequence_number: 15,
-                response_type: BW_RESULTS_CONTINUOUS,
-                time_delta_ms: 150,
-                byte_count: 1024,
-            }
-        );
-    }
-
-    #[cfg(feature = "udp")]
-    #[test]
-    fn malformed_udp_autodetect_subheader_does_not_end_rdp_session() {
-        let invalid = TunnelSubHeader {
-            sub_header_type: SubHeaderType::AutoDetectRequest,
-            data: vec![0, 0],
-        };
-        let mut responder = AutoDetectResponder::default();
-        assert!(udp_autodetect_responses(
-            &[invalid], &mut responder, MonotonicInstant::from_millis(10)
-        ).is_empty());
-    }
 
     fn mouse_move(x: u16, y: u16) -> FastPathInputEvent {
         FastPathInputEvent::MouseEvent(MousePdu {
