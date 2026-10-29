@@ -13,6 +13,12 @@ categories.workspace = true
 
 [lib]
 doctest = false
+
+# Narrow opt-in integration target: do not enable the whole library test suite.
+[[test]]
+name = "udp_autodetect"
+path = "tests/udp_autodetect.rs"
+required-features = ["udp"]
 test = false
 
 [features]
