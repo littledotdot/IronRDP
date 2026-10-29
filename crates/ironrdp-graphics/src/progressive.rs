@@ -3967,10 +3967,24 @@ mod tests {
         use ironrdp_pdu::codecs::rfx::RfxRectangle;
         use ironrdp_pdu::codecs::rfx::progressive::{
             ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
-            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+            ProgressiveRegion, ProgressiveSyncPdu, ProgressiveTile, TileSimple, encode_progressive_stream,
         };
-        // CONTEXT and REGION bit 0 both exist, but mean different things.
+
+        // Decode a real tile with opposite CONTEXT/REGION bits; verify both
+        // the effective mode and the decoded tile's persisted mode.
         for (context_flags, region_flags, expected_dwt) in [(1, 0, false), (0, 1, true)] {
+            let base = TileState::new().base_quant[0];
+            let mut coefficients = [0i16; COEFFICIENTS_PER_COMPONENT];
+            let mut encoded = [0u8; 32768];
+            let encoded_len = encode_first_pass(
+                &mut coefficients,
+                &mut encoded,
+                &base,
+                &ComponentCodecQuant::LOSSLESS,
+                expected_dwt,
+            )
+            .expect("encode first pass");
+            let data = &encoded[..encoded_len];
             let stream = encode_progressive_stream(&[
                 ProgressiveBlock::Sync(ProgressiveSyncPdu),
                 ProgressiveBlock::Context(ProgressiveContextPdu {
@@ -3982,18 +3996,25 @@ mod tests {
                 ProgressiveBlock::Region(ProgressiveRegion {
                     tile_size: 64,
                     rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
-                    quant_vals: vec![],
+                    quant_vals: vec![base],
                     quant_prog_vals: vec![],
                     flags: region_flags,
-                    tiles: vec![],
+                    tiles: vec![ProgressiveTile::Simple(TileSimple {
+                        quant_idx_y: 0, quant_idx_cb: 0, quant_idx_cr: 0,
+                        x_idx: 0, y_idx: 0, flags: 0,
+                        y_data: data, cb_data: data, cr_data: data, tail_data: &[],
+                    })],
                 }),
                 ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
             ]).expect("progressive test stream");
 
             let mut decoder = ProgressiveDecoder::new();
-            decoder.decode_bitmap(1, 0, 64, 64, &stream).expect("decode");
+            let decoded = decoder.decode_bitmap(1, 0, 64, 64, &stream).expect("decode");
+            assert_eq!(decoded.len(), 1);
+            let surface = decoder.surfaces.get(&1).expect("surface");
+            assert_eq!(surface.use_reduce_extrapolate, expected_dwt);
             assert_eq!(
-                decoder.surfaces.get(&1).expect("surface").use_reduce_extrapolate,
+                surface.get(0, 0).expect("decoded tile").use_reduce_extrapolate,
                 expected_dwt,
                 "CONTEXT flags {context_flags:#x}; REGION flags {region_flags:#x}"
             );
