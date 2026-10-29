@@ -4420,7 +4420,7 @@ async fn active_session(
                         match (udp_tunnel.transport.as_mut(), pending_udp_payload.is_none()) {
                             (Some(transport), true) => transport.recv_message().await,
                             (Some(_), false) | (None, _) => {
-                                core::future::pending::<Option<Vec<u8>>>().await
+                                core::future::pending::<Option<TunnelMessage>>().await
                             }
                         }
                     }
@@ -4441,6 +4441,11 @@ async fn active_session(
                             &message.sub_headers, &mut udp_autodetect, now,
                         );
                         if !replies.is_empty() {
+                            debug!(
+                                requests = message.sub_headers.len(),
+                                replies = replies.len(),
+                                "Sending RDPEMT UDP auto-detect responses on same tunnel"
+                            );
                             if let Some(transport) = udp_tunnel.transport.as_ref() {
                                 let response = TunnelMessage { sub_headers: replies, data: Vec::new() };
                                 let Some(result) = cancelable_operation(
