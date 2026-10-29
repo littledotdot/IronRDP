@@ -17,7 +17,7 @@ use tracing::debug;
 ///
 /// [\[MS-RDPBCGR\] 3.2.5.14]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/16ffa852-8aa7-481c-99a0-36c1a9a198f6
 #[derive(Debug, Default)]
-pub(crate) struct AutoDetectResponder {
+pub struct AutoDetectResponder {
     bandwidth: Option<BandwidthMeasurement>,
 }
 
@@ -35,7 +35,7 @@ struct BandwidthMeasurement {
 
 impl AutoDetectResponder {
     /// Counts received bytes while a bandwidth window is open.
-    pub(crate) fn record_bytes(&mut self, bytes: usize) {
+    pub fn record_bytes(&mut self, bytes: usize) {
         if let Some(measurement) = self.bandwidth.as_mut() {
             measurement.bytes = measurement
                 .bytes
@@ -47,7 +47,7 @@ impl AutoDetectResponder {
     ///
     /// Without an arrival time for both the Start and the Stop, a Bandwidth Measure Stop is
     /// answered with `timeDelta = 1` and `byteCount = 0`.
-    pub(crate) fn respond(
+    pub fn respond(
         &mut self,
         request: AutoDetectRequest,
         received_at: Option<MonotonicInstant>,
