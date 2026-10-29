@@ -1359,7 +1359,9 @@ pub struct ProgressiveDecoder {
     references: BTreeMap<SubBandDiffingTileKey, DecDwtQ>,
     frame_tiles: BTreeMap<u16, BTreeSet<(u16, u16)>>,
     frame_active: bool,
-    surface_context_flags: BTreeMap<u16, bool>,
+    /// Surfaces for which a codec CONTEXT has been established. The CONTEXT
+    /// flag controls sub-band diffing, not the REGION DWT layout.
+    surface_context_seen: BTreeSet<u16>,
 }
 
 impl ProgressiveDecoder {
@@ -1370,7 +1372,7 @@ impl ProgressiveDecoder {
             references: BTreeMap::new(),
             frame_tiles: BTreeMap::new(),
             frame_active: false,
-            surface_context_flags: BTreeMap::new(),
+            surface_context_seen: BTreeSet::new(),
         }
     }
 
@@ -1410,36 +1412,18 @@ impl ProgressiveDecoder {
 
         let blocks = decode_progressive_stream(bitmap_data)?;
 
-        // Extract the band-layout flag from the CONTEXT block when present.
-        // Per MS-RDPEGFX 2.2.4.2 the SYNC + CONTEXT blocks establish a codec
-        // context once and are not required to be
-        // repeated on subsequent frames that reference the same context.
-        // Real-world servers (xrdp, GNOME Remote Desktop) omit the CONTEXT
-        // block on every frame after the first one that established the
-        // context. The strict requirement rejected each of those frames with
-        // `MissingBlock("CONTEXT")`, freezing the image on the coarse first
-        // pass.
-        //
-        // Fall back to the value the surface's tile grid was created with, then to the last
-        // one this surface described: Windows opens a new codec context id mid-session,
-        // deletes the previous one, and never repeats SYNC + CONTEXT. The retained value is
-        // scoped to its surface and released with it. Only error when no source is available
-        // at all.
-        let signalled = blocks.iter().find_map(|block| match block {
-            ProgressiveBlock::Context(ctx) => Some(ctx.uses_reduce_extrapolate()),
-            _ => None,
-        });
-        if let Some(flag) = signalled {
-            self.surface_context_flags.insert(surface_id, flag);
+        // CONTEXT establishes the codec but its flag is SUBBAND_DIFFING;
+        // only REGION flags select the reduce-extrapolate DWT layout.
+        // Windows and other servers may omit CONTEXT in subsequent frames,
+        // including after moving a surface to a new codec context id.
+        if blocks.iter().any(|block| matches!(block, ProgressiveBlock::Context(_))) {
+            self.surface_context_seen.insert(surface_id);
         }
-        let use_reduce_extrapolate = signalled
-            .or_else(|| {
-                self.surfaces
-                    .get(&surface_id)
-                    .map(|surface| surface.use_reduce_extrapolate)
-            })
-            .or_else(|| self.surface_context_flags.get(&surface_id).copied())
-            .ok_or(ProgressiveDecodeError::MissingBlock("CONTEXT"))?;
+        if !self.surface_context_seen.contains(&surface_id) && !self.surfaces.contains_key(&surface_id) {
+            return Err(ProgressiveDecodeError::MissingBlock("CONTEXT"));
+        }
+        let initial_dwt_mode = self.surfaces.get(&surface_id)
+            .is_some_and(|surface| surface.use_reduce_extrapolate);
 
         // Direct users of the decoder get one self-contained frame per call.
         // The EGFX client brackets multiple payloads with begin_frame/end_frame.
@@ -1455,7 +1439,7 @@ impl ProgressiveDecoder {
             Entry::Vacant(e) => e.insert(SurfaceTiles::new(
                 surface_width,
                 surface_height,
-                use_reduce_extrapolate,
+                initial_dwt_mode,
             )?),
         };
 
@@ -1465,9 +1449,8 @@ impl ProgressiveDecoder {
         let surface_resized =
             surface.width_pixels != surface_width || surface.height_pixels != surface_height;
         if surface_resized {
-            *surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
+            *surface = SurfaceTiles::new(surface_width, surface_height, initial_dwt_mode)?;
         }
-        surface.use_reduce_extrapolate = use_reduce_extrapolate;
 
         let frame_tiles = all_frame_tiles.entry(surface_id).or_default();
         if surface_resized {
@@ -1497,6 +1480,10 @@ impl ProgressiveDecoder {
                 _ => continue,
             };
 
+            // CONTEXT bit 0 indicates SUBBAND_DIFFING; REGION bit 0 chooses
+            // the DWT mode for tiles, and the two must not be conflated.
+            let region_use_reduce_extrapolate = region.uses_reduce_extrapolate();
+            surface.use_reduce_extrapolate = region_use_reduce_extrapolate;
             let mut region_tiles = BTreeMap::new();
             for tile_block in &region.tiles {
                 let tiles = decode_tile_block(
@@ -1506,7 +1493,7 @@ impl ProgressiveDecoder {
                     tile_block,
                     &region.quant_vals,
                     &region.quant_prog_vals,
-                    use_reduce_extrapolate,
+                    region_use_reduce_extrapolate,
                 )?;
                 for tile in tiles {
                     let key = (tile.x_idx, tile.y_idx);
@@ -1613,7 +1600,7 @@ impl ProgressiveDecoder {
         self.references
             .retain(|(reference_surface_id, _, _), _| *reference_surface_id != surface_id);
         self.frame_tiles.remove(&surface_id);
-        self.surface_context_flags.remove(&surface_id);
+        self.surface_context_seen.remove(&surface_id);
     }
 
     /// Reset tile state while retaining surface sub-band references.
@@ -3972,6 +3959,45 @@ mod tests {
             ),
             Err(ProgressiveDecodeError::MissingTileReference { x_idx: 0, y_idx: 0 })
         ));
+    }
+
+
+    #[test]
+    fn progressive_dwt_layout_follows_region_not_context_flags() {
+        use ironrdp_pdu::codecs::rfx::RfxRectangle;
+        use ironrdp_pdu::codecs::rfx::progressive::{
+            ProgressiveBlock, ProgressiveContextPdu, ProgressiveFrameBeginPdu, ProgressiveFrameEndPdu,
+            ProgressiveRegion, ProgressiveSyncPdu, encode_progressive_stream,
+        };
+        // CONTEXT and REGION bit 0 both exist, but mean different things.
+        for (context_flags, region_flags, expected_dwt) in [(1, 0, false), (0, 1, true)] {
+            let stream = encode_progressive_stream(&[
+                ProgressiveBlock::Sync(ProgressiveSyncPdu),
+                ProgressiveBlock::Context(ProgressiveContextPdu {
+                    context_id: 0, tile_size: 64, flags: context_flags,
+                }),
+                ProgressiveBlock::FrameBegin(ProgressiveFrameBeginPdu {
+                    frame_index: 0, region_count: 1,
+                }),
+                ProgressiveBlock::Region(ProgressiveRegion {
+                    tile_size: 64,
+                    rects: vec![RfxRectangle { x: 0, y: 0, width: 64, height: 64 }],
+                    quant_vals: vec![],
+                    quant_prog_vals: vec![],
+                    flags: region_flags,
+                    tiles: vec![],
+                }),
+                ProgressiveBlock::FrameEnd(ProgressiveFrameEndPdu),
+            ]).expect("progressive test stream");
+
+            let mut decoder = ProgressiveDecoder::new();
+            decoder.decode_bitmap(1, 0, 64, 64, &stream).expect("decode");
+            assert_eq!(
+                decoder.surfaces.get(&1).expect("surface").use_reduce_extrapolate,
+                expected_dwt,
+                "CONTEXT flags {context_flags:#x}; REGION flags {region_flags:#x}"
+            );
+        }
     }
 
     #[test]
