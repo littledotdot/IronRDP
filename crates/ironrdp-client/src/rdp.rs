@@ -21,6 +21,8 @@ pub use ironrdp_cliprdr::backend::CliprdrBackendFactory;
 use ironrdp_connector::connection_activation::ConnectionActivationState;
 use ironrdp_connector::{ConnectionOutcome, ConnectionResult, ConnectorResult};
 use ironrdp_core::WriteBuf;
+#[cfg(feature = "udp")]
+use ironrdp_core::{MonotonicInstant, decode, encode_vec};
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout, MonitorLayoutEntry};
 #[cfg(all(windows, feature = "dvc-com-plugin"))]
@@ -45,6 +47,10 @@ use ironrdp_pdu::input::mouse_rel::{MouseRelPdu, PointerRelFlags};
 ))]
 use ironrdp_pdu::pdu_other_err;
 use ironrdp_pdu::rdp::autodetect::AutoDetectRequest;
+#[cfg(feature = "udp")]
+use ironrdp_rdpemt::{SubHeaderType, TunnelSubHeader};
+#[cfg(feature = "udp")]
+use ironrdp_rdpeudp_tokio::TunnelMessage;
 use ironrdp_pdu::rdp::capability_sets::InputFlags;
 use ironrdp_pdu::rdp::multitransport::MultitransportResponsePdu;
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
@@ -63,6 +69,8 @@ use ironrdp_session::{
     ActiveStage, ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason, SessionError, SessionErrorExt as _,
     SessionResult,
 };
+#[cfg(feature = "udp")]
+use ironrdp_session::AutoDetectResponder;
 use ironrdp_svc::SvcMessage;
 use ironrdp_tokio::reqwest::ReqwestNetworkClient;
 use ironrdp_tokio::{FramedWrite, single_sequence_step_read, split_tokio_framed};
@@ -3925,6 +3933,59 @@ enum RdpControlFlow {
     ServerRedirection(Box<ServerRedirectionPdu>),
 }
 
+// The RDPEMT subheader is the complete MS-RDPBCGR auto-detect header:
+// SubHeaderLength/Type are also autoDetectReq.headerLength/headerTypeId.
+// Preserve it rather than using UdpTransport::recv(), which drops the
+// subheaders and leaves the server's UDP RTT/bandwidth probes unanswered.
+#[cfg(feature = "udp")]
+fn udp_autodetect_responses(
+    sub_headers: &[TunnelSubHeader],
+    responder: &mut AutoDetectResponder,
+    now: MonotonicInstant,
+) -> Vec<TunnelSubHeader> {
+    let mut replies = Vec::new();
+    for header in sub_headers {
+        if header.sub_header_type != SubHeaderType::AutoDetectRequest {
+            continue;
+        }
+        let Ok(length) = u8::try_from(header.wire_size()) else {
+            warn!("Ignoring oversized RDPEMT auto-detect subheader");
+            continue;
+        };
+        let mut encoded = Vec::with_capacity(header.wire_size());
+        encoded.extend_from_slice(&[length, SubHeaderType::AutoDetectRequest.to_u8()]);
+        encoded.extend_from_slice(&header.data);
+        let request = match decode::<AutoDetectRequest>(&encoded) {
+            Ok(request) => request,
+            Err(error) => {
+                warn!(%error, length = encoded.len(), "Ignoring invalid UDP auto-detect request");
+                continue;
+            }
+        };
+        let Some(response) = responder.respond(request, Some(now)) else {
+            continue;
+        };
+        // AutoDetectResponse already encodes the same two-byte
+        // headerLength/headerTypeId that RDPEMT uses for its subheader.
+        let data = match encode_vec(&response) {
+            Ok(data) => data,
+            Err(error) => {
+                warn!(%error, "Failed to encode UDP auto-detect response");
+                continue;
+            }
+        };
+        if data.len() < 2 || data[1] != SubHeaderType::AutoDetectResponse.to_u8() {
+            warn!("Ignoring invalid encoded UDP auto-detect response");
+            continue;
+        }
+        replies.push(TunnelSubHeader {
+            sub_header_type: SubHeaderType::AutoDetectResponse,
+            data: data[2..].to_vec(),
+        });
+    }
+    replies
+}
+
 struct ActiveSessionIteration {
     outputs: Vec<ActiveStageOutput>,
     dvc_batch: Option<DvcMessageBatch>,
@@ -4225,6 +4286,10 @@ async fn active_session(
     let mut post_logon_redraw_requested = false;
     let mut pending_udp_payload: Option<Vec<u8>> = None;
     #[cfg(feature = "udp")]
+    let mut udp_autodetect = AutoDetectResponder::default();
+    #[cfg(feature = "udp")]
+    let udp_autodetect_epoch = Instant::now();
+    #[cfg(feature = "udp")]
     let mut udp_dvc_was_active = false;
     let mut initial_outputs = if *graceful_close_receiver.borrow_and_update() {
         graceful_shutdown_sent = true;
@@ -4318,6 +4383,13 @@ async fn active_session(
                     let (action, payload) = match frame {
                         Ok(frame) => frame,
                         Err(error) if is_transport_read_error(&error) => {
+                            #[cfg(feature = "udp")]
+                            warn!(
+                                error = %error,
+                                udp_dvc_active = active_stage.reliable_udp_dvc_tunnel_in_use(),
+                                udp_transport = ?udp_tunnel.transport,
+                                "Main TCP/TLS read failed; recording UDP task status before transport cleanup"
+                            );
                             return Ok(RdpControlFlow::TransportFailure(
                                 ironrdp_session::custom_err!("read frame", error),
                             ));
@@ -4393,7 +4465,7 @@ async fn active_session(
                     #[cfg(feature = "udp")]
                     {
                         match (udp_tunnel.transport.as_mut(), pending_udp_payload.is_none()) {
-                            (Some(transport), true) => transport.recv().await,
+                            (Some(transport), true) => transport.recv_message().await,
                             (Some(_), false) | (None, _) => {
                                 core::future::pending::<Option<Vec<u8>>>().await
                             }
@@ -4404,6 +4476,38 @@ async fn active_session(
                         core::future::pending::<Option<Vec<u8>>>().await
                     }
                 } => {
+                    #[cfg(feature = "udp")]
+                    let udp_payload = if let Some(message) = udp_payload {
+                        let now = MonotonicInstant::from_millis(
+                            u64::try_from(udp_autodetect_epoch.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        );
+                        // Count tunnel payload bytes on this transport while a
+                        // continuous bandwidth measurement is in progress.
+                        udp_autodetect.record_bytes(message.data.len());
+                        let replies = udp_autodetect_responses(
+                            &message.sub_headers, &mut udp_autodetect, now,
+                        );
+                        if !replies.is_empty() {
+                            if let Some(transport) = udp_tunnel.transport.as_ref() {
+                                let response = TunnelMessage { sub_headers: replies, data: Vec::new() };
+                                let Some(result) = cancelable_operation(
+                                    transport.send_message(response), close_receiver,
+                                ).await else {
+                                    return Ok(RdpControlFlow::TerminatedGracefully(
+                                        GracefulDisconnectReason::UserInitiated
+                                    ));
+                                };
+                                if let Err(error) = result {
+                                    return Ok(RdpControlFlow::TransportFailure(
+                                        ironrdp_session::custom_err!("write UDP auto-detect response", error),
+                                    ));
+                                }
+                            }
+                        }
+                        Some(message.data)
+                    } else {
+                        None
+                    };
                     match udp_payload {
                     None => {
                         if active_stage.reliable_udp_dvc_tunnel_in_use() {
