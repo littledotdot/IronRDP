@@ -1060,6 +1060,10 @@ impl Default for TileState {
 /// Tiles are lazily allocated on first access to avoid upfront memory
 /// cost for surfaces that only partially receive progressive updates.
 pub struct SurfaceTiles {
+    /// Exact surface width; a resize within the same grid still invalidates tile state.
+    pub width_pixels: u16,
+    /// Exact surface height.
+    pub height_pixels: u16,
     /// Width of the surface in tiles (ceildiv of pixel width by 64).
     pub tiles_wide: u16,
     /// Height of the surface in tiles.
@@ -1095,6 +1099,8 @@ impl SurfaceTiles {
         let count = usize::from(tiles_wide) * usize::from(tiles_high);
 
         Ok(Self {
+            width_pixels,
+            height_pixels,
             tiles_wide,
             tiles_high,
             use_reduce_extrapolate,
@@ -1387,10 +1393,11 @@ impl ProgressiveDecoder {
             )?),
         };
 
-        // If surface dimensions changed, reallocate the tile grid.
-        let expected_wide = surface_width.div_ceil(TILE_DIM);
-        let expected_high = surface_height.div_ceil(TILE_DIM);
-        let surface_resized = surface.tiles_wide != expected_wide || surface.tiles_high != expected_high;
+        // A same-grid resize still invalidates tile history because the previous
+        // coefficients belong to a differently sized surface. Retain sub-band
+        // references: Windows may use them for later difference tiles.
+        let surface_resized =
+            surface.width_pixels != surface_width || surface.height_pixels != surface_height;
         if surface_resized {
             *surface = SurfaceTiles::new(surface_width, surface_height, use_reduce_extrapolate)?;
         }
@@ -3872,6 +3879,45 @@ mod tests {
             ),
             Err(ProgressiveDecodeError::MissingTileReference { x_idx: 0, y_idx: 0 })
         ));
+    }
+
+    #[test]
+    fn same_grid_resize_invalidates_tiles_without_losing_sub_band_references() {
+        let mut decoder = ProgressiveDecoder::new();
+        decoder
+            .decode_bitmap(1, 7, 64, 64, &simple_tile_stream(0, [64, -16, 24], true))
+            .expect("original tile");
+        assert_eq!(
+            decoder.surfaces.get(&1).and_then(|surface| surface.get(0, 0)).map(|tile| tile.pass),
+            Some(1)
+        );
+        let reference = *decoder.references.get(&(1, 0, 0)).expect("reference");
+
+        decoder
+            .decode_bitmap(1, 7, 63, 64, &minimal_progressive_stream(false))
+            .expect("same-grid resize");
+        let surface = decoder.surfaces.get(&1).expect("surface");
+        assert_eq!((surface.width_pixels, surface.height_pixels), (63, 64));
+        assert_eq!((surface.tiles_wide, surface.tiles_high), (1, 1));
+        assert!(surface.get(0, 0).is_none(), "old tile must be invalidated");
+        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
+
+        decoder
+            .decode_bitmap(
+                1, 7, 63, 64,
+                &upgrade_tile_stream(
+                    &[],
+                    ComponentCodecQuant::LOSSLESS,
+                    ComponentCodecQuant::LOSSLESS,
+                    ComponentCodecQuant::LOSSLESS,
+                    false,
+                ),
+            )
+            .expect("upgrade without first pass must be ignored");
+        assert_eq!(
+            decoder.surfaces.get(&1).and_then(|surface| surface.get(0, 0)).map(|tile| tile.pass),
+            Some(0)
+        );
     }
 
     #[test]
