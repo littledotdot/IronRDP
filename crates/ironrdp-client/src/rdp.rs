@@ -4468,6 +4468,12 @@ async fn active_session(
                     };
                     match udp_payload {
                     None => {
+                        #[cfg(feature = "udp")]
+                        warn!(
+                            udp_dvc_active = active_stage.reliable_udp_dvc_tunnel_in_use(),
+                            transport = ?udp_tunnel.transport,
+                            "Reliable UDP RDPEMT receive stream ended; capturing background task state"
+                        );
                         if active_stage.reliable_udp_dvc_tunnel_in_use() {
                             return Ok(RdpControlFlow::TransportFailure(
                                 ironrdp_session::general_err!("reliable UDP tunnel closed"),
