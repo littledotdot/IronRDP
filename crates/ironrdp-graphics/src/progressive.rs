@@ -831,6 +831,9 @@ pub struct TileState {
     pub quant_idx: [u8; 3],
     /// Base quantization tables (Y, Cb, Cr) used when reconstructing pixels.
     pub base_quant: [ComponentCodecQuant; 3],
+    /// Base quantization from the latest successfully decoded pass; the effective
+    /// upgrade BitPos includes this as well as progressive quantization.
+    pub last_upgrade_base_quant: [ComponentCodecQuant; 3],
     /// Progressive pass counter (0 = no data, 1 = first pass complete, 2+ = upgrade).
     pub pass: u16,
     /// Whether the tile was encoded as a difference tile.
@@ -850,12 +853,7 @@ struct FirstPassOptions {
 impl TileState {
     /// Create a new tile with zeroed state.
     pub fn new() -> Self {
-        Self {
-            coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
-            sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
-            prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
-            quant_idx: [0; 3],
-            base_quant: [ComponentCodecQuant {
+        let base_quant = [ComponentCodecQuant {
                 ll3: 6,
                 hl3: 6,
                 lh3: 6,
@@ -866,7 +864,14 @@ impl TileState {
                 hl1: 6,
                 lh1: 6,
                 hh1: 6,
-            }; 3],
+            }; 3];
+        Self {
+            coefficients: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
+            sign: [[0; COEFFICIENTS_PER_COMPONENT]; 3],
+            prog_quant: [ComponentCodecQuant::LOSSLESS; 3],
+            quant_idx: [0; 3],
+            base_quant,
+            last_upgrade_base_quant: base_quant,
             pass: 0,
             is_difference: false,
             quality: 0,
@@ -947,6 +952,7 @@ impl TileState {
         self.quality = options.quality;
         self.quant_idx = options.quant_idx;
         self.base_quant = [*base_quants[0], *base_quants[1], *base_quants[2]];
+        self.last_upgrade_base_quant = self.base_quant;
         self.use_reduce_extrapolate = options.use_reduce_extrapolate;
         self.is_difference = reference.is_some();
         self.prog_quant = prog_quants;
@@ -971,6 +977,25 @@ impl TileState {
         prog_quants: [ComponentCodecQuant; 3],
         quality: u8,
     ) -> Result<(), SrlError> {
+        self.decode_upgrade_with_base(
+            srl_data,
+            raw_data,
+            prog_quants,
+            self.last_upgrade_base_quant,
+            self.use_reduce_extrapolate,
+            quality,
+        )
+    }
+
+    fn decode_upgrade_with_base(
+        &mut self,
+        srl_data: [&[u8]; 3],
+        raw_data: [&[u8]; 3],
+        prog_quants: [ComponentCodecQuant; 3],
+        next_base_quant: [ComponentCodecQuant; 3],
+        use_reduce_extrapolate: bool,
+        quality: u8,
+    ) -> Result<(), SrlError> {
         let prev_prog_quant = self.prog_quant;
         let mut coefficients = self.coefficients;
         let mut sign = self.sign;
@@ -981,7 +1006,7 @@ impl TileState {
                 raw_data[c],
                 &prev_prog_quant[c],
                 &prog_quants[c],
-                self.use_reduce_extrapolate,
+                use_reduce_extrapolate,
                 &mut coefficients[c],
                 &mut sign[c],
             )?;
@@ -990,6 +1015,8 @@ impl TileState {
         self.coefficients = coefficients;
         self.sign = sign;
         self.prog_quant = prog_quants;
+        self.last_upgrade_base_quant = next_base_quant;
+        self.use_reduce_extrapolate = use_reduce_extrapolate;
         self.quality = quality;
         self.pass = self.pass.saturating_add(1);
 
@@ -1192,6 +1219,13 @@ pub enum ProgressiveDecodeError {
     TileOutOfBounds { x_idx: u16, y_idx: u16 },
     /// Region references a quant index beyond the table.
     InvalidQuantIndex { index: usize, table_len: usize },
+    /// An upgrade would discard refinement bits instead of increasing quality.
+    InvalidUpgradeQuantization {
+        component: usize,
+        band: usize,
+        previous: u16,
+        next: u16,
+    },
     /// A difference tile has no previously decoded state to use as its reference.
     MissingTileReference { x_idx: u16, y_idx: u16 },
     /// Surface dimensions exceed [`MAX_SURFACE_DIM`] per axis.
@@ -1210,6 +1244,12 @@ impl core::fmt::Display for ProgressiveDecodeError {
             }
             Self::InvalidQuantIndex { index, table_len } => {
                 write!(f, "quant index {index} exceeds table length {table_len}")
+            }
+            Self::InvalidUpgradeQuantization { component, band, previous, next } => {
+                write!(
+                    f,
+                    "progressive upgrade component {component} band {band} regresses from bit position {previous} to {next}"
+                )
             }
             Self::MissingTileReference { x_idx, y_idx } => {
                 write!(f, "difference tile ({x_idx}, {y_idx}) has no retained reference")
@@ -1241,6 +1281,32 @@ impl From<SrlError> for ProgressiveDecodeError {
     fn from(e: SrlError) -> Self {
         Self::Srl(e)
     }
+}
+
+/// Effective BitPos is base quantization plus progressive quantization.
+fn validate_upgrade_quantization(
+    previous_base: &[ComponentCodecQuant; 3],
+    previous_progressive: &[ComponentCodecQuant; 3],
+    next_base: &[ComponentCodecQuant; 3],
+    next_progressive: &[ComponentCodecQuant; 3],
+) -> Result<(), ProgressiveDecodeError> {
+    for component in 0..3 {
+        for band in 0..NUM_BANDS {
+            let previous = u16::from(previous_base[component].for_band(band))
+                + u16::from(previous_progressive[component].for_band(band));
+            let next = u16::from(next_base[component].for_band(band))
+                + u16::from(next_progressive[component].for_band(band));
+            if next > previous {
+                return Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                    component,
+                    band,
+                    previous,
+                    next,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn charge_region_clipping_work(used: &mut usize, units: usize) -> Result<(), ProgressiveDecodeError> {
@@ -1736,11 +1802,38 @@ fn decode_tile_block(
             }
 
             let pq = progressive_quant_for(tile.quality, prog_quant_vals)?;
-
-            tile_state.decode_upgrade(
+            let next_base = [
+                *quant_vals.get(usize::from(tile.quant_idx_y)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_y),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cb)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cb),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+                *quant_vals.get(usize::from(tile.quant_idx_cr)).ok_or(
+                    ProgressiveDecodeError::InvalidQuantIndex {
+                        index: usize::from(tile.quant_idx_cr),
+                        table_len: quant_vals.len(),
+                    },
+                )?,
+            ];
+            validate_upgrade_quantization(
+                &tile_state.last_upgrade_base_quant,
+                &tile_state.prog_quant,
+                &next_base,
+                &[pq.y_quant, pq.cb_quant, pq.cr_quant],
+            )?;
+            tile_state.decode_upgrade_with_base(
                 [tile.y_srl_data, tile.cb_srl_data, tile.cr_srl_data],
                 [tile.y_raw_data, tile.cb_raw_data, tile.cr_raw_data],
                 [pq.y_quant, pq.cb_quant, pq.cr_quant],
+                next_base,
+                use_reduce_extrapolate,
                 tile.quality,
             )?;
             references.insert((surface_id, x_idx, y_idx), tile_state.coefficients);
@@ -3918,6 +4011,60 @@ mod tests {
             decoder.surfaces.get(&1).and_then(|surface| surface.get(0, 0)).map(|tile| tile.pass),
             Some(0)
         );
+    }
+
+    #[test]
+    fn rejects_quantization_regressions_but_allows_effective_bitpos_refinement() {
+        let mut previous_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut previous_progressive = [ComponentCodecQuant::LOSSLESS; 3];
+        let mut next_base = [ComponentCodecQuant::LOSSLESS; 3];
+        let next_progressive = [ComponentCodecQuant::LOSSLESS; 3];
+        previous_base[0].hl1 = 6;
+        previous_progressive[0].hl1 = 2;
+        next_base[0].hl1 = 7; // 8 -> 7: finer, despite increasing the base quant
+        assert!(validate_upgrade_quantization(
+            &previous_base, &previous_progressive, &next_base, &next_progressive
+        ).is_ok());
+        next_base[0].hl1 = 9;
+        assert!(matches!(
+            validate_upgrade_quantization(
+                &previous_base, &previous_progressive, &next_base, &next_progressive
+            ),
+            Err(ProgressiveDecodeError::InvalidUpgradeQuantization {
+                component: 0,
+                previous: 8,
+                next: 9,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_upgrade_keeps_prior_tile_and_reference_unchanged() {
+        let mut decoder = ProgressiveDecoder::new();
+        let base = ComponentCodecQuant::LOSSLESS;
+        let first = ComponentCodecQuant::LOSSLESS;
+        let first_data = encode_full_quality_component(64);
+        decoder
+            .decode_bitmap(1, 7, 64, 64, &first_tile_stream(0, &first_data, base, first, true))
+            .expect("first tile");
+        let before = decoder.surfaces.get(&1).and_then(|s| s.get(0, 0))
+            .expect("tile").coefficients;
+        let reference = *decoder.references.get(&(1, 0, 0)).expect("reference");
+        let mut coarser = ComponentCodecQuant::LOSSLESS;
+        coarser.hl1 = 1;
+
+        let result = decoder.decode_bitmap(
+            1, 7, 64, 64, &upgrade_tile_stream(&[], base, first, coarser, false)
+        );
+        assert!(matches!(
+            result,
+            Err(ProgressiveDecodeError::InvalidUpgradeQuantization { .. })
+        ));
+        let tile = decoder.surfaces.get(&1).and_then(|s| s.get(0, 0)).expect("tile");
+        assert_eq!(tile.pass, 1);
+        assert_eq!(tile.coefficients, before);
+        assert_eq!(decoder.references.get(&(1, 0, 0)), Some(&reference));
     }
 
     #[test]
